@@ -11,6 +11,7 @@ import { AuthResponseDto, UserDto } from './dto/auth-response.dto';
 import { User } from './entities/user.entity';
 import { RefreshToken } from './entities/refresh-token.entity';
 import { TBaseDTO } from '../common/dto/base.dto';
+import { OAuth2Client } from 'google-auth-library';
 
 /**
  * Service for authentication operations
@@ -19,6 +20,7 @@ import { TBaseDTO } from '../common/dto/base.dto';
 export class AuthService implements OnModuleInit {
   private readonly ACCESS_TOKEN_EXPIRY = '15m'; // 15 minutes
   private readonly REFRESH_TOKEN_EXPIRY = '7d'; // 7 days
+  private googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
   constructor(
     @InjectRepository(User)
@@ -130,45 +132,47 @@ export class AuthService implements OnModuleInit {
   async googleLogin(
     googleLoginDto: GoogleLoginDto,
   ): Promise<TBaseDTO<AuthResponseDto>> {
-    // In a real implementation, verify the Google token with Google's API
-    // For this mock, we'll simulate a successful verification
     try {
       // Mock Google token verification
       // In production, use: https://www.googleapis.com/oauth2/v3/tokeninfo?id_token=TOKEN
-      const mockGoogleUser = {
-        email: 'google.user@example.com',
-        name: 'Google User',
-        googleId: 'google_123456789',
-      };
+      const ticket = await this.googleClient.verifyIdToken({
+        idToken: googleLoginDto.googleToken,
+        audience: process.env.GOOGLE_CLIENT_ID,
+      });
 
-      // Find or create user
+      const payload = ticket.getPayload();
+      if (!payload) {
+        throw new Error('Invalid Google token');
+      }
+
+      const email = payload.email;
+      const name = payload.name;
+      const googleId = payload.sub; // IMPORTANT: Google's unique user ID
+
+      // 2. Find user by googleId or email
       let user = await this.userRepository.findOne({
-        where: { googleId: mockGoogleUser.googleId },
+        where: [{ googleId }, { email }],
       });
 
       if (!user) {
-        // Check if user exists with this email
-        user = await this.userRepository.findOne({
-          where: { email: mockGoogleUser.email },
+        // Create new Google user
+        user = this.userRepository.create({
+          email,
+          name,
+          googleId,
+          password: null,
         });
 
-        if (user) {
-          // Update existing user with Google ID
-          user.googleId = mockGoogleUser.googleId;
-          user.name = mockGoogleUser.name;
-          await this.userRepository.save(user);
-        } else {
-          // Create new user
-          user = this.userRepository.create({
-            email: mockGoogleUser.email,
-            password: null, // No password for Google users
-            name: mockGoogleUser.name,
-            googleId: mockGoogleUser.googleId,
-          });
+        await this.userRepository.save(user);
+      } else {
+        // Update googleId on existing user if needed
+        if (!user.googleId) {
+          user.googleId = googleId;
           await this.userRepository.save(user);
         }
       }
 
+      // 3. Generate JWT access & refresh tokens
       return this.generateAuthResponse(user);
     } catch (error) {
       return new TBaseDTO<AuthResponseDto>(

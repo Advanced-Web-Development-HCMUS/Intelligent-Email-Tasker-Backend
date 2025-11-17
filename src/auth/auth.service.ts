@@ -20,7 +20,7 @@ import { OAuth2Client } from 'google-auth-library';
 export class AuthService implements OnModuleInit {
   private readonly ACCESS_TOKEN_EXPIRY = '15m'; // 15 minutes
   private readonly REFRESH_TOKEN_EXPIRY = '7d'; // 7 days
-  private googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+  private googleClient: OAuth2Client;
 
   constructor(
     @InjectRepository(User)
@@ -34,6 +34,11 @@ export class AuthService implements OnModuleInit {
    * Initialize default user on module init
    */
   async onModuleInit(): Promise<void> {
+    // Initialize Google OAuth client
+    const googleClientId = process.env.GOOGLE_CLIENT_ID;
+    if (googleClientId) {
+      this.googleClient = new OAuth2Client(googleClientId);
+    }
     await this.initializeDefaultUser();
   }
 
@@ -133,8 +138,20 @@ export class AuthService implements OnModuleInit {
     googleLoginDto: GoogleLoginDto,
   ): Promise<TBaseDTO<AuthResponseDto>> {
     try {
-      // Mock Google token verification
-      // In production, use: https://www.googleapis.com/oauth2/v3/tokeninfo?id_token=TOKEN
+      // Check if Google client is initialized
+      if (!this.googleClient) {
+        const googleClientId = process.env.GOOGLE_CLIENT_ID;
+        if (!googleClientId) {
+          return new TBaseDTO<AuthResponseDto>(
+            undefined,
+            undefined,
+            'Google OAuth is not configured. Please set GOOGLE_CLIENT_ID in environment variables.',
+          );
+        }
+        this.googleClient = new OAuth2Client(googleClientId);
+      }
+
+      // Verify Google ID token
       const ticket = await this.googleClient.verifyIdToken({
         idToken: googleLoginDto.googleToken,
         audience: process.env.GOOGLE_CLIENT_ID,
@@ -142,17 +159,37 @@ export class AuthService implements OnModuleInit {
 
       const payload = ticket.getPayload();
       if (!payload) {
-        throw new Error('Invalid Google token');
+        return new TBaseDTO<AuthResponseDto>(
+          undefined,
+          undefined,
+          'Invalid Google token: No payload received',
+        );
+      }
+
+      // Validate required fields
+      if (!payload.email) {
+        return new TBaseDTO<AuthResponseDto>(
+          undefined,
+          undefined,
+          'Invalid Google token: Email not found in token',
+        );
       }
 
       const email = payload.email;
-      const name = payload.name;
-      const googleId = payload.sub; // IMPORTANT: Google's unique user ID
+      const name = payload.name || payload.given_name || 'Google User';
+      const googleId = payload.sub; // Google's unique user ID
 
-      // 2. Find user by googleId or email
+      // Find user by googleId first, then by email
       let user = await this.userRepository.findOne({
-        where: [{ googleId }, { email }],
+        where: { googleId },
       });
+
+      if (!user) {
+        // Try to find by email
+        user = await this.userRepository.findOne({
+          where: { email },
+        });
+      }
 
       if (!user) {
         // Create new Google user
@@ -165,20 +202,49 @@ export class AuthService implements OnModuleInit {
 
         await this.userRepository.save(user);
       } else {
-        // Update googleId on existing user if needed
+        // Update googleId and name on existing user if needed
         if (!user.googleId) {
           user.googleId = googleId;
-          await this.userRepository.save(user);
         }
+        if (!user.name || user.name === 'Google User') {
+          user.name = name;
+        }
+        await this.userRepository.save(user);
       }
 
-      // 3. Generate JWT access & refresh tokens
+      // Generate JWT access & refresh tokens
       return this.generateAuthResponse(user);
-    } catch (error) {
+    } catch (error: any) {
+      // Log the actual error for debugging
+      console.error('Google OAuth error:', error.message || error);
+      
+      // Return more specific error messages
+      if (error.message?.includes('Token used too early')) {
+        return new TBaseDTO<AuthResponseDto>(
+          undefined,
+          undefined,
+          'Google token is not yet valid. Please try again.',
+        );
+      }
+      if (error.message?.includes('Token used too late')) {
+        return new TBaseDTO<AuthResponseDto>(
+          undefined,
+          undefined,
+          'Google token has expired. Please sign in again.',
+        );
+      }
+      if (error.message?.includes('audience')) {
+        return new TBaseDTO<AuthResponseDto>(
+          undefined,
+          undefined,
+          'Invalid Google token: Audience mismatch. Please check GOOGLE_CLIENT_ID configuration.',
+        );
+      }
+
       return new TBaseDTO<AuthResponseDto>(
         undefined,
         undefined,
-        'Invalid Google token',
+        `Invalid Google token: ${error.message || 'Token verification failed'}`,
       );
     }
   }

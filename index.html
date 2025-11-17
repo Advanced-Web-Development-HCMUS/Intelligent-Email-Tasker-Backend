@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Google Sign-In Test</title>
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+</head>
+<body>
+  <h1>Google Sign-In Demo</h1>
+
+  <!-- Nút Google Sign-In sẽ xuất hiện ở đây -->
+  <div id="g_id_onload"
+       data-client_id="937640220818-5galg3n8oo6nef95mguchau5gjef9fg2.apps.googleusercontent.com"
+       data-callback="handleCredentialResponse">
+  </div>
+  <div class="g_id_signin" data-type="standard"></div>
+
+  <script>
+    // Callback nhận JWT token từ Google
+    function handleCredentialResponse(response) {
+      console.log("JWT token:", response.credential);
+
+      // Ví dụ: parse token để lấy thông tin user
+      const base64Url = response.credential.split('.')[1];
+      const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+      const user = JSON.parse(decodeURIComponent(atob(base64).split('').map(function(c) {
+          return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
+      }).join('')));
+      console.log("User info:", user);
+
+      alert("Hello " + user.name + " (" + user.email + ")");
+    }
+  </script>
+</body>
+</html>

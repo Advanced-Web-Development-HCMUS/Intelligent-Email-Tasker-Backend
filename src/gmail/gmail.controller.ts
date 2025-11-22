@@ -124,6 +124,7 @@ export class GmailController {
    */
   @Post('fetch')
   @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Fetch emails from Gmail and store in database' })
   @ApiResponse({
@@ -163,6 +164,8 @@ export class GmailController {
    * Get stored emails from database
    */
   @Get('emails')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Get stored emails from database' })
   @ApiQuery({ name: 'page', required: false, type: Number, description: 'Page number (default: 1)' })

@@ -4,6 +4,7 @@ import { Repository } from 'typeorm';
 import { google } from 'googleapis';
 import { EmailRaw } from './entities/email-raw.entity';
 import { User } from '../auth/entities/user.entity';
+import { KafkaService } from '../kafka/kafka.service';
 
 /**
  * Service for Gmail integration
@@ -15,6 +16,7 @@ export class GmailService {
     private readonly emailRawRepository: Repository<EmailRaw>,
     @InjectRepository(User)
     private readonly userRepository: Repository<User>,
+    private readonly kafkaService: KafkaService,
   ) {}
 
   /**
@@ -140,6 +142,7 @@ export class GmailService {
       const messages = response.data.messages || [];
       let storedCount = 0;
       let skippedCount = 0;
+      const storedEmailIds: number[] = [];
 
       // Process each message
       for (const message of messages) {
@@ -276,8 +279,9 @@ export class GmailService {
               rawData: JSON.stringify(msg),
             });
 
-            await this.emailRawRepository.save(emailRaw);
+            const savedEmail = await this.emailRawRepository.save(emailRaw);
             storedCount++;
+            storedEmailIds.push(savedEmail.id);
           } catch (dbError: any) {
             console.error(`Error saving email ${message.id} to database:`, dbError.message);
             // Continue with next message
@@ -285,6 +289,16 @@ export class GmailService {
         } catch (error: any) {
           console.error(`Error processing message ${message.id}:`, error.message);
           // Continue with next message
+        }
+      }
+
+      // Publish event to Kafka for AI processing
+      if (storedCount > 0 && storedEmailIds.length > 0) {
+        try {
+          await this.kafkaService.publishEmailFetchedEvent(userId, storedEmailIds);
+        } catch (kafkaError: any) {
+          console.error('Failed to publish Kafka event:', kafkaError);
+          // Don't fail the whole operation if Kafka fails
         }
       }
 

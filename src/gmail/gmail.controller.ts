@@ -10,6 +10,7 @@ import {
   HttpStatus,
   Res,
   BadRequestException,
+  Param,
 } from '@nestjs/common';
 import { Response } from 'express';
 import {
@@ -18,6 +19,7 @@ import {
   ApiResponse,
   ApiBearerAuth,
   ApiQuery,
+  ApiParam,
 } from '@nestjs/swagger';
 import { GmailService } from './gmail.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
@@ -195,6 +197,121 @@ export class GmailController {
 
     const result = await this.gmailService.getStoredEmails(userId, pageNum, limitNum);
     return new TBaseDTO<{ emails: any[]; total: number; page: number; limit: number }>(result);
+  }
+
+  /**
+   * Get list of mailboxes (Inbox, Sent, etc.)
+   */
+  @Get('mailboxes')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Get list of mailboxes' })
+  @ApiResponse({
+    status: 200,
+    description: 'Mailboxes retrieved successfully',
+    type: TBaseDTO<{ mailboxes: Array<{ id: string; name: string; count: number; unreadCount: number }> }>,
+  })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  async getMailboxes(
+    @Request() req: any,
+  ): Promise<TBaseDTO<{ mailboxes: Array<{ id: string; name: string; count: number; unreadCount: number }> }>> {
+    const userId = req.user.userId;
+    const result = await this.gmailService.getMailboxes(userId);
+    return new TBaseDTO<{ mailboxes: Array<{ id: string; name: string; count: number; unreadCount: number }> }>(result);
+  }
+
+  /**
+   * Get emails in a specific mailbox
+   */
+  @Get('mailboxes/:id/emails')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Get emails in a mailbox' })
+  @ApiParam({ name: 'id', description: 'Mailbox ID (e.g., INBOX, SENT, DRAFT)', example: 'INBOX' })
+  @ApiQuery({ name: 'page', required: false, type: Number, description: 'Page number (default: 1)' })
+  @ApiQuery({ name: 'limit', required: false, type: Number, description: 'Items per page (default: 20, max: 100)' })
+  @ApiQuery({ name: 'isRead', required: false, type: Boolean, description: 'Filter by read status' })
+  @ApiQuery({ name: 'isStarred', required: false, type: Boolean, description: 'Filter by starred status' })
+  @ApiResponse({
+    status: 200,
+    description: 'Emails retrieved successfully',
+    type: TBaseDTO<{ emails: any[]; total: number; page: number; limit: number; mailbox: string }>,
+  })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 404, description: 'Mailbox not found' })
+  async getEmailsByMailbox(
+    @Request() req: any,
+    @Param('id') mailboxId: string,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+    @Query('isRead') isRead?: string,
+    @Query('isStarred') isStarred?: string,
+  ): Promise<TBaseDTO<{ emails: any[]; total: number; page: number; limit: number; mailbox: string }>> {
+    const userId = req.user.userId;
+    const pageNum = page ? parseInt(page, 10) : 1;
+    const limitNum = limit ? Math.min(parseInt(limit, 10), 100) : 20;
+
+    if (pageNum < 1 || limitNum < 1) {
+      return new TBaseDTO<{ emails: any[]; total: number; page: number; limit: number; mailbox: string }>(
+        undefined,
+        undefined,
+        'Page and limit must be positive numbers',
+      );
+    }
+
+    const filters: { isRead?: boolean; isStarred?: boolean } = {};
+    if (isRead !== undefined) {
+      filters.isRead = isRead === 'true';
+    }
+    if (isStarred !== undefined) {
+      filters.isStarred = isStarred === 'true';
+    }
+
+    const result = await this.gmailService.getEmailsByMailbox(
+      userId,
+      mailboxId,
+      pageNum,
+      limitNum,
+      filters,
+    );
+
+    return new TBaseDTO<{ emails: any[]; total: number; page: number; limit: number; mailbox: string }>(result);
+  }
+
+  /**
+   * Get email detail by ID
+   */
+  @Get('emails/:id')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Get email detail by ID' })
+  @ApiParam({ name: 'id', description: 'Email ID', type: Number, example: 1 })
+  @ApiResponse({
+    status: 200,
+    description: 'Email detail retrieved successfully',
+    type: TBaseDTO<any>,
+  })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 404, description: 'Email not found' })
+  async getEmailDetail(
+    @Request() req: any,
+    @Param('id', GGJParseIntPipe) emailId: number,
+  ): Promise<TBaseDTO<any>> {
+    const userId = req.user.userId;
+    const email = await this.gmailService.getEmailDetail(userId, emailId);
+
+    if (!email) {
+      return new TBaseDTO<any>(
+        undefined,
+        undefined,
+        'Email not found',
+      );
+    }
+
+    return new TBaseDTO<any>(email);
   }
 }
 

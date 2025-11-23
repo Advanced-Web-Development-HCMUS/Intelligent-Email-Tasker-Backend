@@ -18,7 +18,7 @@ import { OAuth2Client } from 'google-auth-library';
  */
 @Injectable()
 export class AuthService implements OnModuleInit {
-  private readonly ACCESS_TOKEN_EXPIRY = '15m'; // 15 minutes
+  private readonly ACCESS_TOKEN_EXPIRY = '2h'; // 2 hours
   private readonly REFRESH_TOKEN_EXPIRY = '7d'; // 7 days
   private googleClient: OAuth2Client;
 

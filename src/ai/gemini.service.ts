@@ -177,7 +177,7 @@ Respond in JSON format:
 
     try {
       const embeddingModel = this.genAI.getGenerativeModel({
-        model: 'text-embedding-004',
+        model: 'gemini-embedding-001',
       });
   
       const result = await embeddingModel.embedContent(text);
@@ -186,33 +186,6 @@ Respond in JSON format:
       console.warn('Embedding generation failed, using fallback:', error.message);
       throw new Error('Failed to generate embedding');
     }
-  }
-
-  /**
-   * Fallback embedding method
-   */
-  private fallbackEmbedding(text: string): number[] {
-    // Simple hash-based embedding (not ideal, but works as fallback)
-    const hash = (str: string): number => {
-      let hash = 0;
-      for (let i = 0; i < str.length; i++) {
-        const char = str.charCodeAt(i);
-        hash = (hash << 5) - hash + char;
-        hash = hash & hash; // Convert to 32bit integer
-      }
-      return Math.abs(hash);
-    };
-
-    const words = text.toLowerCase().split(/\s+/);
-    const embedding = new Array(768).fill(0);
-    words.forEach((word, index) => {
-      const hashValue = hash(word);
-      embedding[index % 768] += hashValue / 1000000;
-    });
-
-    // Normalize
-    const magnitude = Math.sqrt(embedding.reduce((sum, val) => sum + val * val, 0));
-    return embedding.map((val) => val / magnitude);
   }
 }
 

@@ -349,6 +349,259 @@ export class GmailService {
   }
 
   /**
+   * Get list of mailboxes (Inbox, Sent, etc.) based on labels
+   */
+  async getMailboxes(
+    userId: number,
+  ): Promise<{ mailboxes: Array<{ id: string; name: string; count: number; unreadCount: number }> }> {
+    const MAX_MAILBOXES = 50;
+    const commonMailboxes = [
+      { id: 'INBOX', name: 'Inbox' },
+      { id: 'SENT', name: 'Sent' },
+      { id: 'DRAFT', name: 'Drafts' },
+      { id: 'SPAM', name: 'Spam' },
+      { id: 'TRASH', name: 'Trash' },
+      { id: 'IMPORTANT', name: 'Important' },
+      { id: 'STARRED', name: 'Starred' },
+    ];
+
+    const mailboxes: Array<{ id: string; name: string; count: number; unreadCount: number }> = [];
+
+    // Get counts for common mailboxes
+    for (const mailbox of commonMailboxes) {
+      let count = 0;
+      let unreadCount = 0;
+
+      if (mailbox.id === 'STARRED') {
+        count = await this.emailRawRepository.count({
+          where: {
+            userId,
+            isStarred: true,
+          },
+        });
+        unreadCount = await this.emailRawRepository.count({
+          where: {
+            userId,
+            isStarred: true,
+            isRead: false,
+          },
+        });
+      } else if (mailbox.id === 'IMPORTANT') {
+        count = await this.emailRawRepository.count({
+          where: {
+            userId,
+            isImportant: true,
+          },
+        });
+        unreadCount = await this.emailRawRepository.count({
+          where: {
+            userId,
+            isImportant: true,
+            isRead: false,
+          },
+        });
+      } else {
+        count = await this.emailRawRepository
+          .createQueryBuilder('email')
+          .where('email.userId = :userId', { userId })
+          .andWhere('email.labels LIKE :label', { label: `%${mailbox.id}%` })
+          .getCount();
+
+        unreadCount = await this.emailRawRepository
+          .createQueryBuilder('email')
+          .where('email.userId = :userId', { userId })
+          .andWhere('email.labels LIKE :label', { label: `%${mailbox.id}%` })
+          .andWhere('email.isRead = :isRead', { isRead: false })
+          .getCount();
+      }
+
+      mailboxes.push({
+        id: mailbox.id,
+        name: mailbox.name,
+        count,
+        unreadCount,
+      });
+    }
+
+    // Get other custom labels from emails
+    const emailsWithLabels = await this.emailRawRepository
+      .createQueryBuilder('email')
+      .select('email.labels', 'labels')
+      .where('email.userId = :userId', { userId })
+      .andWhere('email.labels IS NOT NULL')
+      .limit(MAX_MAILBOXES)
+      .getRawMany();
+
+    const customLabels = new Set<string>();
+    emailsWithLabels.forEach((email) => {
+      try {
+        const labels = JSON.parse(email.labels);
+        if (Array.isArray(labels)) {
+          labels.forEach((label: string) => {
+            // Skip common mailboxes and system labels
+            if (
+              !commonMailboxes.some((m) => m.id === label) &&
+              !label.startsWith('CATEGORY_') &&
+              !label.startsWith('UNREAD')
+            ) {
+              customLabels.add(label);
+            }
+          });
+        }
+      } catch (e) {
+        // Ignore parsing errors
+      }
+    });
+
+    // Add custom labels with counts
+    for (const label of Array.from(customLabels).slice(0, 20)) {
+      const count = await this.emailRawRepository
+        .createQueryBuilder('email')
+        .where('email.userId = :userId', { userId })
+        .andWhere('email.labels LIKE :label', { label: `%${label}%` })
+        .getCount();
+
+      const unreadCount = await this.emailRawRepository
+        .createQueryBuilder('email')
+        .where('email.userId = :userId', { userId })
+        .andWhere('email.labels LIKE :label', { label: `%${label}%` })
+        .andWhere('email.isRead = :isRead', { isRead: false })
+        .getCount();
+
+      mailboxes.push({
+        id: label,
+        name: label.replace(/_/g, ' ').replace(/\b\w/g, (l) => l.toUpperCase()),
+        count,
+        unreadCount,
+      });
+    }
+
+    return { mailboxes };
+  }
+
+  /**
+   * Get emails in a specific mailbox with pagination and filtering
+   */
+  async getEmailsByMailbox(
+    userId: number,
+    mailboxId: string,
+    page: number = 1,
+    limit: number = 20,
+    filters: { isRead?: boolean; isStarred?: boolean } = {},
+  ): Promise<{
+    emails: any[];
+    total: number;
+    page: number;
+    limit: number;
+    mailbox: string;
+  }> {
+    const skip = (page - 1) * limit;
+
+    // Build query
+    const queryBuilder = this.emailRawRepository
+      .createQueryBuilder('email')
+      .where('email.userId = :userId', { userId });
+
+    // Filter by mailbox (label)
+    if (mailboxId === 'STARRED') {
+      queryBuilder.andWhere('email.isStarred = :isStarred', { isStarred: true });
+    } else if (mailboxId === 'IMPORTANT') {
+      queryBuilder.andWhere('email.isImportant = :isImportant', { isImportant: true });
+    } else {
+      queryBuilder.andWhere('email.labels LIKE :label', { label: `%${mailboxId}%` });
+    }
+
+    // Apply additional filters
+    if (filters.isRead !== undefined) {
+      queryBuilder.andWhere('email.isRead = :isRead', { isRead: filters.isRead });
+    }
+    if (filters.isStarred !== undefined) {
+      queryBuilder.andWhere('email.isStarred = :isStarred', { isStarred: filters.isStarred });
+    }
+
+    // Get total count
+    const total = await queryBuilder.getCount();
+
+    // Get emails with pagination
+    const emails = await queryBuilder
+      .orderBy('email.receivedAt', 'DESC')
+      .addOrderBy('email.sentAt', 'DESC')
+      .skip(skip)
+      .take(limit)
+      .getMany();
+
+    // Format emails for response
+    const formattedEmails = emails.map((email) => ({
+      id: email.id,
+      gmailId: email.gmailId,
+      threadId: email.threadId,
+      from: email.from,
+      fromName: email.fromName,
+      to: email.to ? JSON.parse(email.to) : [],
+      cc: email.cc ? JSON.parse(email.cc) : [],
+      bcc: email.bcc ? JSON.parse(email.bcc) : [],
+      subject: email.subject,
+      snippet: email.snippet,
+      isRead: email.isRead,
+      isStarred: email.isStarred,
+      isImportant: email.isImportant,
+      labels: email.labels ? JSON.parse(email.labels) : [],
+      receivedAt: email.receivedAt,
+      sentAt: email.sentAt,
+      createdAt: email.createdAt,
+    }));
+
+    return {
+      emails: formattedEmails,
+      total,
+      page,
+      limit,
+      mailbox: mailboxId,
+    };
+  }
+
+  /**
+   * Get email detail by ID
+   */
+  async getEmailDetail(userId: number, emailId: number): Promise<any | null> {
+    const email = await this.emailRawRepository.findOne({
+      where: {
+        id: emailId,
+        userId,
+      },
+    });
+
+    if (!email) {
+      return null;
+    }
+
+    // Parse JSON fields
+    return {
+      id: email.id,
+      gmailId: email.gmailId,
+      threadId: email.threadId,
+      from: email.from,
+      fromName: email.fromName,
+      to: email.to ? JSON.parse(email.to) : [],
+      cc: email.cc ? JSON.parse(email.cc) : [],
+      bcc: email.bcc ? JSON.parse(email.bcc) : [],
+      subject: email.subject,
+      snippet: email.snippet,
+      bodyText: email.bodyText,
+      bodyHtml: email.bodyHtml,
+      isRead: email.isRead,
+      isStarred: email.isStarred,
+      isImportant: email.isImportant,
+      labels: email.labels ? JSON.parse(email.labels) : [],
+      receivedAt: email.receivedAt,
+      sentAt: email.sentAt,
+      rawData: email.rawData ? JSON.parse(email.rawData) : null,
+      createdAt: email.createdAt,
+      updatedAt: email.updatedAt,
+    };
+  }
+
+  /**
    * Get stored emails for a user
    */
   async getStoredEmails(

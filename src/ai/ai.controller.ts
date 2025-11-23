@@ -88,7 +88,7 @@ export class AIController {
         limit,
       );
 
-      const filteredResults = results.filter(r => r.score > 0.05);
+      const filteredResults = results.filter(r => r.score > 0.5);
 
       return new TBaseDTO<{ results: any[] }>({ results: filteredResults });
     } catch (error: any) {

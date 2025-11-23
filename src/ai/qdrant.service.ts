@@ -48,7 +48,7 @@ export class QdrantService implements OnModuleInit {
       if (!exists) {
         await this.client.createCollection(this.collectionName, {
           vectors: {
-            size: 768, // Embedding dimension (can be adjusted based on embedding model)
+            size: 3072, // Embedding dimension (can be adjusted based on embedding model)
             distance: 'Cosine',
           },
         });
@@ -95,19 +95,6 @@ export class QdrantService implements OnModuleInit {
       }
 
       const pointId: number = emailId;
-
-      // Validate embedding size matches collection
-      if (embedding.length !== 768) {
-        console.warn(
-          `Embedding size ${embedding.length} does not match collection size 768. Adjusting...`,
-        );
-        // Pad or truncate to match collection size
-        const adjustedEmbedding = new Array(768).fill(0);
-        for (let i = 0; i < Math.min(embedding.length, 768); i++) {
-          adjustedEmbedding[i] = embedding[i];
-        }
-        embedding = adjustedEmbedding;
-      }
 
       await this.client.upsert(this.collectionName, {
         wait: true,

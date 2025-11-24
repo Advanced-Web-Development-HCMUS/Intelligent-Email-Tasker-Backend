@@ -3,6 +3,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { google } from 'googleapis';
 import { EmailRaw } from './entities/email-raw.entity';
+import { GmailToken } from './entities/gmail-token.entity';
 import { User } from '../auth/entities/user.entity';
 import { KafkaService } from '../kafka/kafka.service';
 
@@ -11,9 +12,13 @@ import { KafkaService } from '../kafka/kafka.service';
  */
 @Injectable()
 export class GmailService {
+  private refreshLocks = new Map<number, Promise<string>>(); // Concurrency guard for token refresh
+
   constructor(
     @InjectRepository(EmailRaw)
     private readonly emailRawRepository: Repository<EmailRaw>,
+    @InjectRepository(GmailToken)
+    private readonly gmailTokenRepository: Repository<GmailToken>,
     @InjectRepository(User)
     private readonly userRepository: Repository<User>,
     private readonly kafkaService: KafkaService,
@@ -48,6 +53,8 @@ export class GmailService {
 
     const scopes = [
       'https://www.googleapis.com/auth/gmail.readonly',
+      'https://www.googleapis.com/auth/gmail.modify', // For mark read/unread, delete, labels
+      'https://www.googleapis.com/auth/gmail.send', // For send/reply
       'https://www.googleapis.com/auth/userinfo.email',
       'https://www.googleapis.com/auth/userinfo.profile',
     ];
@@ -63,22 +70,32 @@ export class GmailService {
   }
 
   /**
-   * Exchange authorization code for tokens
+   * Exchange authorization code for tokens and store securely
    */
   async exchangeCodeForTokens(
     code: string,
+    userId?: number,
   ): Promise<{ accessToken: string; refreshToken?: string; expiresIn?: number }> {
     const oauth2Client = this.createOAuth2Client();
 
     try {
       const { tokens } = await oauth2Client.getToken(code);
 
+      const accessToken = tokens.access_token || '';
+      const refreshToken = tokens.refresh_token;
+      const expiresIn = tokens.expiry_date
+        ? Math.floor((tokens.expiry_date - Date.now()) / 1000)
+        : undefined;
+
+      // Store refresh token securely if userId provided
+      if (userId && refreshToken) {
+        await this.saveGmailToken(userId, refreshToken, accessToken, expiresIn);
+      }
+
       return {
-        accessToken: tokens.access_token || '',
-        refreshToken: tokens.refresh_token,
-        expiresIn: tokens.expiry_date
-          ? Math.floor((tokens.expiry_date - Date.now()) / 1000)
-          : undefined,
+        accessToken,
+        refreshToken,
+        expiresIn,
       };
     } catch (error: any) {
       throw new Error(`Failed to exchange code for tokens: ${error.message}`);
@@ -86,11 +103,126 @@ export class GmailService {
   }
 
   /**
+   * Save or update Gmail OAuth tokens for a user
+   */
+  async saveGmailToken(
+    userId: number,
+    refreshToken: string,
+    accessToken?: string,
+    expiresIn?: number,
+  ): Promise<GmailToken> {
+    let token = await this.gmailTokenRepository.findOne({
+      where: { userId },
+    });
+
+    const accessTokenExpiry = accessToken && expiresIn
+      ? new Date(Date.now() + expiresIn * 1000)
+      : null;
+
+    if (token) {
+      token.refreshToken = refreshToken;
+      if (accessToken) {
+        token.accessToken = accessToken;
+        token.accessTokenExpiry = accessTokenExpiry;
+      }
+    } else {
+      token = this.gmailTokenRepository.create({
+        userId,
+        refreshToken,
+        accessToken: accessToken || null,
+        accessTokenExpiry,
+      });
+    }
+
+    return await this.gmailTokenRepository.save(token);
+  }
+
+  /**
+   * Get valid access token for user (refresh if needed)
+   */
+  async getValidAccessToken(userId: number): Promise<string> {
+    const token = await this.gmailTokenRepository.findOne({
+      where: { userId },
+    });
+
+    if (!token) {
+      throw new Error('Gmail token not found. Please re-authenticate with Google.');
+    }
+
+    // Check if access token is still valid (with 5 minute buffer)
+    if (
+      token.accessToken &&
+      token.accessTokenExpiry &&
+      token.accessTokenExpiry.getTime() > Date.now() + 5 * 60 * 1000
+    ) {
+      return token.accessToken;
+    }
+
+    // Refresh token if already in progress, wait for it
+    if (this.refreshLocks.has(userId)) {
+      return await this.refreshLocks.get(userId)!;
+    }
+
+    // Start refresh
+    const refreshPromise = this.refreshAccessToken(userId, token.refreshToken);
+    this.refreshLocks.set(userId, refreshPromise);
+
+    try {
+      const newAccessToken = await refreshPromise;
+      return newAccessToken;
+    } finally {
+      this.refreshLocks.delete(userId);
+    }
+  }
+
+  /**
+   * Refresh access token using refresh token
+   */
+  private async refreshAccessToken(
+    userId: number,
+    refreshToken: string,
+  ): Promise<string> {
+    const oauth2Client = this.createOAuth2Client();
+    oauth2Client.setCredentials({
+      refresh_token: refreshToken,
+    });
+
+    try {
+      const { credentials } = await oauth2Client.refreshAccessToken();
+      const newAccessToken = credentials.access_token || '';
+      const expiresIn = credentials.expiry_date
+        ? Math.floor((credentials.expiry_date - Date.now()) / 1000)
+        : undefined;
+
+      // Update stored token
+      await this.saveGmailToken(userId, refreshToken, newAccessToken, expiresIn);
+
+      return newAccessToken;
+    } catch (error: any) {
+      // If refresh fails, delete token and force re-auth
+      await this.gmailTokenRepository.delete({ userId });
+      throw new Error(
+        `Failed to refresh access token: ${error.message}. Please re-authenticate.`,
+      );
+    }
+  }
+
+  /**
+   * Get Gmail API client with valid token
+   */
+  private async getGmailClient(userId: number) {
+    const accessToken = await this.getValidAccessToken(userId);
+    const oauth2Client = this.createOAuth2Client(accessToken);
+    return google.gmail({ version: 'v1', auth: oauth2Client });
+  }
+
+  /**
    * Fetch emails from Gmail and store in database
+   * If accessToken is provided, use it; otherwise use stored token with auto-refresh
    */
   async fetchAndStoreEmails(
     userId: number,
-    accessToken: string,
+    accessToken?: string,
     refreshToken?: string,
     maxResults: number = 50,
   ): Promise<{ success: boolean; count: number; message: string }> {
@@ -101,16 +233,15 @@ export class GmailService {
         return { success: false, count: 0, message: 'User not found' };
       }
 
-      // Validate access token
-      if (!accessToken) {
-        return { success: false, count: 0, message: 'Access token is required' };
+      let gmail;
+      if (accessToken) {
+        // Use provided access token (legacy support)
+        const oauth2Client = this.createOAuth2Client(accessToken, refreshToken);
+        gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+      } else {
+        // Use stored token with auto-refresh
+        gmail = await this.getGmailClient(userId);
       }
-
-      // Create OAuth2 client
-      const oauth2Client = this.createOAuth2Client(accessToken, refreshToken);
-
-      // Create Gmail API client
-      const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
 
       // Fetch messages
       let response;
@@ -622,6 +753,328 @@ export class GmailService {
       page,
       limit,
     };
+  }
+
+  /**
+   * Send email via Gmail API
+   */
+  async sendEmail(
+    userId: number,
+    to: string[],
+    subject: string,
+    body: string,
+    cc?: string[],
+    bcc?: string[],
+    attachments?: Array<{ filename: string; content: string; contentType: string }>,
+  ): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    try {
+      const gmail = await this.getGmailClient(userId);
+
+      // Build email message
+      const messageParts: string[] = [];
+      messageParts.push(`To: ${to.join(', ')}`);
+      if (cc && cc.length > 0) {
+        messageParts.push(`Cc: ${cc.join(', ')}`);
+      }
+      if (bcc && bcc.length > 0) {
+        messageParts.push(`Bcc: ${bcc.join(', ')}`);
+      }
+      messageParts.push(`Subject: ${subject}`);
+      messageParts.push('Content-Type: text/html; charset=utf-8');
+      messageParts.push('');
+      messageParts.push(body);
+
+      const rawMessage = messageParts.join('\r\n');
+
+      // Encode message
+      const encodedMessage = Buffer.from(rawMessage)
+        .toString('base64')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+
+      const response = await gmail.users.messages.send({
+        userId: 'me',
+        requestBody: {
+          raw: encodedMessage,
+        },
+      });
+
+      return {
+        success: true,
+        messageId: response.data.id || undefined,
+      };
+    } catch (error: any) {
+      console.error('Send email error:', error);
+      return {
+        success: false,
+        error: error.message || 'Failed to send email',
+      };
+    }
+  }
+
+  /**
+   * Reply to an email
+   */
+  async replyToEmail(
+    userId: number,
+    emailId: number,
+    replyBody: string,
+    attachments?: Array<{ filename: string; content: string; contentType: string }>,
+  ): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    try {
+      // Get original email from database
+      const originalEmail = await this.emailRawRepository.findOne({
+        where: { id: emailId, userId },
+      });
+
+      if (!originalEmail) {
+        return { success: false, error: 'Email not found' };
+      }
+
+      // Get original message from Gmail to get headers
+      const gmail = await this.getGmailClient(userId);
+      const originalMessage = await gmail.users.messages.get({
+        userId: 'me',
+        id: originalEmail.gmailId,
+        format: 'metadata',
+        metadataHeaders: ['From', 'To', 'Subject', 'Message-ID'],
+      });
+
+      const headers = originalMessage.data.payload?.headers || [];
+      const getHeader = (name: string) =>
+        headers.find((h: any) => h.name === name)?.value || '';
+
+      const fromEmail = getHeader('From');
+      const toEmail = getHeader('To') || fromEmail;
+      const subject = getHeader('Subject');
+      const messageId = getHeader('Message-ID');
+
+      // Build reply message
+      const messageParts: string[] = [];
+      messageParts.push(`To: ${toEmail}`);
+      messageParts.push(`Subject: Re: ${subject.replace(/^Re:\s*/i, '')}`);
+      if (messageId) {
+        messageParts.push(`In-Reply-To: ${messageId}`);
+        messageParts.push(`References: ${messageId}`);
+      }
+      messageParts.push('Content-Type: text/html; charset=utf-8');
+      messageParts.push('');
+      messageParts.push(replyBody);
+
+      const rawMessage = messageParts.join('\r\n');
+
+      // Encode message
+      const encodedMessage = Buffer.from(rawMessage)
+        .toString('base64')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+
+      const response = await gmail.users.messages.send({
+        userId: 'me',
+        requestBody: {
+          raw: encodedMessage,
+          threadId: originalEmail.threadId || undefined,
+        },
+      });
+
+      return {
+        success: true,
+        messageId: response.data.id || undefined,
+      };
+    } catch (error: any) {
+      console.error('Reply email error:', error);
+      return {
+        success: false,
+        error: error.message || 'Failed to reply to email',
+      };
+    }
+  }
+
+  /**
+   * Modify email (mark read/unread, star, delete)
+   */
+  async modifyEmail(
+    userId: number,
+    emailId: number,
+    actions: {
+      markRead?: boolean;
+      addLabelIds?: string[];
+      removeLabelIds?: string[];
+    },
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      const email = await this.emailRawRepository.findOne({
+        where: { id: emailId, userId },
+      });
+
+      if (!email) {
+        return { success: false, error: 'Email not found' };
+      }
+
+      const gmail = await this.getGmailClient(userId);
+
+      const addLabelIds: string[] = [];
+      const removeLabelIds: string[] = [];
+
+      if (actions.markRead !== undefined) {
+        if (actions.markRead) {
+          removeLabelIds.push('UNREAD');
+        } else {
+          addLabelIds.push('UNREAD');
+        }
+      }
+
+      if (actions.addLabelIds) {
+        addLabelIds.push(...actions.addLabelIds);
+      }
+      if (actions.removeLabelIds) {
+        removeLabelIds.push(...actions.removeLabelIds);
+      }
+
+      await gmail.users.messages.modify({
+        userId: 'me',
+        id: email.gmailId,
+        requestBody: {
+          addLabelIds: addLabelIds.length > 0 ? addLabelIds : undefined,
+          removeLabelIds: removeLabelIds.length > 0 ? removeLabelIds : undefined,
+        },
+      });
+
+      // Update local database
+      if (actions.markRead !== undefined) {
+        email.isRead = actions.markRead;
+        await this.emailRawRepository.save(email);
+      }
+
+      return { success: true };
+    } catch (error: any) {
+      console.error('Modify email error:', error);
+      return {
+        success: false,
+        error: error.message || 'Failed to modify email',
+      };
+    }
+  }
+
+  /**
+   * Delete email
+   */
+  async deleteEmail(
+    userId: number,
+    emailId: number,
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      const email = await this.emailRawRepository.findOne({
+        where: { id: emailId, userId },
+      });
+
+      if (!email) {
+        return { success: false, error: 'Email not found' };
+      }
+
+      const gmail = await this.getGmailClient(userId);
+
+      await gmail.users.messages.delete({
+        userId: 'me',
+        id: email.gmailId,
+      });
+
+      // Delete from local database
+      await this.emailRawRepository.delete({ id: emailId });
+
+      return { success: true };
+    } catch (error: any) {
+      console.error('Delete email error:', error);
+      return {
+        success: false,
+        error: error.message || 'Failed to delete email',
+      };
+    }
+  }
+
+  /**
+   * Get attachment by email ID and attachment ID
+   */
+  async getAttachment(
+    userId: number,
+    emailId: number,
+    attachmentId: string,
+  ): Promise<{ success: boolean; data?: Buffer; filename?: string; contentType?: string; error?: string }> {
+    try {
+      const email = await this.emailRawRepository.findOne({
+        where: { id: emailId, userId },
+      });
+
+      if (!email) {
+        return { success: false, error: 'Email not found' };
+      }
+
+      const gmail = await this.getGmailClient(userId);
+
+      const response = await gmail.users.messages.attachments.get({
+        userId: 'me',
+        messageId: email.gmailId,
+        id: attachmentId,
+      });
+
+      const attachmentData = response.data.data;
+      if (!attachmentData) {
+        return { success: false, error: 'Attachment data not found' };
+      }
+
+      // Decode base64url
+      const buffer = Buffer.from(
+        attachmentData.replace(/-/g, '+').replace(/_/g, '/'),
+        'base64',
+      );
+
+      // Try to get filename from email raw data
+      let filename = 'attachment';
+      let contentType = 'application/octet-stream';
+
+      try {
+        if (email.rawData) {
+          const rawData = JSON.parse(email.rawData);
+          const findAttachment = (parts: any[]): any => {
+            for (const part of parts) {
+              if (part.body?.attachmentId === attachmentId) {
+                return part;
+              }
+              if (part.parts) {
+                const found = findAttachment(part.parts);
+                if (found) return found;
+              }
+            }
+            return null;
+          };
+
+          const attachment = findAttachment(
+            rawData.payload?.parts || [rawData.payload] || [],
+          );
+          if (attachment) {
+            filename = attachment.filename || filename;
+            contentType = attachment.mimeType || contentType;
+          }
+        }
+      } catch (e) {
+        // Ignore parsing errors
+      }
+
+      return {
+        success: true,
+        data: buffer,
+        filename,
+        contentType,
+      };
+    } catch (error: any) {
+      console.error('Get attachment error:', error);
+      return {
+        success: false,
+        error: error.message || 'Failed to get attachment',
+      };
+    }
   }
 }
 

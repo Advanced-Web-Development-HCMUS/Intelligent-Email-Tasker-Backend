@@ -852,7 +852,7 @@ export class GmailService {
 
       // Build reply message
       const messageParts: string[] = [];
-      messageParts.push(`To: ${toEmail}`);
+      messageParts.push(`To: ${fromEmail}`);
       messageParts.push(`Subject: Re: ${subject.replace(/^Re:\s*/i, '')}`);
       if (messageId) {
         messageParts.push(`In-Reply-To: ${messageId}`);

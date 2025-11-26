@@ -2,6 +2,7 @@ import {
   Controller,
   Post,
   Get,
+  Delete,
   Body,
   Query,
   UseGuards,
@@ -25,6 +26,9 @@ import { GmailService } from './gmail.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { FetchEmailsDto } from './dto/fetch-emails.dto';
 import { OAuthCallbackDto } from './dto/oauth-callback.dto';
+import { SendEmailDto } from './dto/send-email.dto';
+import { ReplyEmailDto } from './dto/reply-email.dto';
+import { ModifyEmailDto } from './dto/modify-email.dto';
 import { TBaseDTO } from '../common/dto/base.dto';
 import { GGJParseIntPipe } from '../common/pipes/parse-int.pipe';
 
@@ -79,11 +83,11 @@ export class GmailController {
       throw new BadRequestException('Missing authorization code');
     }
   
-    // Exchange code for tokens
-    const tokens = await this.gmailService.exchangeCodeForTokens(code);
+    // Extract userId from state (format: userId_timestamp_random)
+    const userId = state ? parseInt(state.split('_')[0], 10) : null;
   
-    // (OPTIONAL) Save tokens to DB here
-    // await this.gmailService.saveTokens(userId, tokens);
+    // Exchange code for tokens and store if userId provided
+    const tokens = await this.gmailService.exchangeCodeForTokens(code, userId || undefined);
   
     return {
       message: "OAuth success",
@@ -96,6 +100,8 @@ export class GmailController {
    * Exchange authorization code for tokens (API endpoint)
    */
   @Post('oauth/token')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Exchange authorization code for access and refresh tokens' })
   @ApiResponse({
@@ -104,11 +110,14 @@ export class GmailController {
     type: TBaseDTO<{ accessToken: string; refreshToken?: string; expiresIn?: number }>,
   })
   @ApiResponse({ status: 400, description: 'Invalid authorization code' })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
   async exchangeToken(
+    @Request() req: any,
     @Body() callbackDto: OAuthCallbackDto,
   ): Promise<TBaseDTO<{ accessToken: string; refreshToken?: string; expiresIn?: number }>> {
     try {
-      const tokens = await this.gmailService.exchangeCodeForTokens(callbackDto.code);
+      const userId = req.user.userId;
+      const tokens = await this.gmailService.exchangeCodeForTokens(callbackDto.code, userId);
       return new TBaseDTO<{ accessToken: string; refreshToken?: string; expiresIn?: number }>(
         tokens,
       );
@@ -312,6 +321,206 @@ export class GmailController {
     }
 
     return new TBaseDTO<any>(email);
+  }
+
+  /**
+   * Send email
+   */
+  @Post('emails/send')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Send email via Gmail API' })
+  @ApiResponse({
+    status: 200,
+    description: 'Email sent successfully',
+    type: TBaseDTO<{ messageId: string }>,
+  })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 400, description: 'Bad request' })
+  async sendEmail(
+    @Request() req: any,
+    @Body() sendEmailDto: SendEmailDto,
+  ): Promise<TBaseDTO<{ messageId: string }>> {
+    const userId = req.user.userId;
+    const result = await this.gmailService.sendEmail(
+      userId,
+      sendEmailDto.to,
+      sendEmailDto.subject,
+      sendEmailDto.body,
+      sendEmailDto.cc,
+      sendEmailDto.bcc,
+    );
+
+    if (result.success && result.messageId) {
+      return new TBaseDTO<{ messageId: string }>({
+        messageId: result.messageId,
+      });
+    } else {
+      return new TBaseDTO<{ messageId: string }>(
+        undefined,
+        undefined,
+        result.error || 'Failed to send email',
+      );
+    }
+  }
+
+  /**
+   * Reply to email
+   */
+  @Post('emails/:id/reply')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Reply to an email' })
+  @ApiParam({ name: 'id', description: 'Email ID', type: Number, example: 1 })
+  @ApiResponse({
+    status: 200,
+    description: 'Reply sent successfully',
+    type: TBaseDTO<{ messageId: string }>,
+  })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 404, description: 'Email not found' })
+  async replyToEmail(
+    @Request() req: any,
+    @Param('id', GGJParseIntPipe) emailId: number,
+    @Body() replyEmailDto: ReplyEmailDto,
+  ): Promise<TBaseDTO<{ messageId: string }>> {
+    const userId = req.user.userId;
+    const result = await this.gmailService.replyToEmail(
+      userId,
+      emailId,
+      replyEmailDto.body,
+    );
+
+    if (result.success && result.messageId) {
+      return new TBaseDTO<{ messageId: string }>({
+        messageId: result.messageId,
+      });
+    } else {
+      return new TBaseDTO<{ messageId: string }>(
+        undefined,
+        undefined,
+        result.error || 'Failed to reply to email',
+      );
+    }
+  }
+
+  /**
+   * Modify email (mark read/unread, star, delete, etc.)
+   */
+  @Post('emails/:id/modify')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Modify email (mark read/unread, star, delete)' })
+  @ApiParam({ name: 'id', description: 'Email ID', type: Number, example: 1 })
+  @ApiResponse({
+    status: 200,
+    description: 'Email modified successfully',
+    type: TBaseDTO<{ success: boolean }>,
+  })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 404, description: 'Email not found' })
+  async modifyEmail(
+    @Request() req: any,
+    @Param('id', GGJParseIntPipe) emailId: number,
+    @Body() modifyEmailDto: ModifyEmailDto,
+  ): Promise<TBaseDTO<{ success: boolean }>> {
+    const userId = req.user.userId;
+    const result = await this.gmailService.modifyEmail(userId, emailId, {
+      markRead: modifyEmailDto.markRead,
+      addLabelIds: modifyEmailDto.addLabelIds,
+      removeLabelIds: modifyEmailDto.removeLabelIds,
+    });
+
+    if (result.success) {
+      return new TBaseDTO<{ success: boolean }>({ success: true });
+    } else {
+      return new TBaseDTO<{ success: boolean }>(
+        undefined,
+        undefined,
+        result.error || 'Failed to modify email',
+      );
+    }
+  }
+
+  /**
+   * Delete email
+   */
+  @Delete('emails/:id')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Delete email' })
+  @ApiParam({ name: 'id', description: 'Email ID', type: Number, example: 1 })
+  @ApiResponse({
+    status: 200,
+    description: 'Email deleted successfully',
+    type: TBaseDTO<{ success: boolean }>,
+  })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 404, description: 'Email not found' })
+  async deleteEmail(
+    @Request() req: any,
+    @Param('id', GGJParseIntPipe) emailId: number,
+  ): Promise<TBaseDTO<{ success: boolean }>> {
+    const userId = req.user.userId;
+    const result = await this.gmailService.deleteEmail(userId, emailId);
+
+    if (result.success) {
+      return new TBaseDTO<{ success: boolean }>({ success: true });
+    } else {
+      return new TBaseDTO<{ success: boolean }>(
+        undefined,
+        undefined,
+        result.error || 'Failed to delete email',
+      );
+    }
+  }
+
+  /**
+   * Get attachment
+   */
+  @Get('attachments/:emailId/:attachmentId')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Get email attachment' })
+  @ApiParam({ name: 'emailId', description: 'Email ID', type: Number, example: 1 })
+  @ApiParam({ name: 'attachmentId', description: 'Attachment ID from Gmail', type: String })
+  @ApiResponse({
+    status: 200,
+    description: 'Attachment retrieved successfully',
+  })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 404, description: 'Attachment not found' })
+  async getAttachment(
+    @Request() req: any,
+    @Param('emailId', GGJParseIntPipe) emailId: number,
+    @Param('attachmentId') attachmentId: string,
+    @Res() res: Response,
+  ): Promise<void> {
+    const userId = req.user.userId;
+    const result = await this.gmailService.getAttachment(
+      userId,
+      emailId,
+      attachmentId,
+    );
+
+    if (result.success && result.data) {
+      res.setHeader('Content-Type', result.contentType || 'application/octet-stream');
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${result.filename || 'attachment'}"`,
+      );
+      res.send(result.data);
+    } else {
+      res.status(404).json({
+        success: false,
+        error: result.error || 'Attachment not found',
+      });
+    }
   }
 }
 

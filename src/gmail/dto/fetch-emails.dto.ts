@@ -10,8 +10,8 @@ export class FetchEmailsDto {
     example: 'ya29.a0AfH6SMBx...',
   })
   @IsString()
-  @IsNotEmpty({ message: 'Access token is required' })
-  accessToken: string;
+  @IsOptional()
+  accessToken?: string;
 
   @ApiProperty({
     description: 'Google OAuth refresh token (optional)',

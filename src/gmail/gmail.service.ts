@@ -47,9 +47,11 @@ export class GmailService {
   /**
    * Generate OAuth authorization URL
    */
-  generateAuthUrl(userId: number): { url: string; state: string } {
+  generateAuthUrl(userId: number, context?: 'onboarding' | 'dashboard'): { url: string; state: string } {
     const oauth2Client = this.createOAuth2Client();
-    const state = `${userId}_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+    // Format: userId_timestamp_random_context
+    const contextSuffix = context ? `_${context}` : '';
+    const state = `${userId}_${Date.now()}_${Math.random().toString(36).substring(7)}${contextSuffix}`;
 
     const scopes = [
       'https://www.googleapis.com/auth/gmail.readonly',
@@ -67,6 +69,49 @@ export class GmailService {
     });
 
     return { url, state };
+  }
+
+  /**
+   * Check Gmail connection status for user
+   */
+  async getConnectionStatus(
+    userId: number,
+  ): Promise<{ connected: boolean; email?: string; lastSync?: string }> {
+    try {
+      const token = await this.gmailTokenRepository.findOne({
+        where: { userId },
+        relations: ['user'],
+      });
+
+      if (!token || !token.refreshToken) {
+        return { connected: false };
+      }
+
+      // Try to get user profile to verify connection
+      const accessToken = await this.getValidAccessToken(userId);
+      if (!accessToken) {
+        return { connected: false };
+      }
+
+      const oauth2Client = this.createOAuth2Client(accessToken);
+      const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+      
+      try {
+        const profileResponse = await gmail.users.getProfile({ userId: 'me' });
+        
+        return {
+          connected: true,
+          email: profileResponse.data.emailAddress,
+          lastSync: token.updatedAt?.toISOString(),
+        };
+      } catch (error) {
+        console.error('Failed to verify Gmail connection:', error);
+        return { connected: false };
+      }
+    } catch (error) {
+      console.error('Error checking Gmail connection status:', error);
+      return { connected: false };
+    }
   }
 
   /**

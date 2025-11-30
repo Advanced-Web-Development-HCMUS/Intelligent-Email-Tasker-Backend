@@ -48,6 +48,7 @@ export class GmailController {
   @ApiBearerAuth('JWT-auth')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Get Google OAuth authorization URL' })
+  @ApiQuery({ name: 'context', required: false, description: 'OAuth context (onboarding or dashboard)' })
   @ApiResponse({
     status: 200,
     description: 'Authorization URL generated successfully',
@@ -56,9 +57,10 @@ export class GmailController {
   @ApiResponse({ status: 401, description: 'Unauthorized' })
   async getAuthUrl(
     @Request() req: any,
+    @Query('context') context?: 'onboarding' | 'dashboard',
   ): Promise<TBaseDTO<{ url: string; state: string }>> {
     const userId = req.user.userId;
-    const result = this.gmailService.generateAuthUrl(userId);
+    const result = this.gmailService.generateAuthUrl(userId, context);
     return new TBaseDTO<{ url: string; state: string }>(result);
   }
 
@@ -66,34 +68,76 @@ export class GmailController {
    * Handle OAuth callback (redirect from Google)
    */
   @Get('oauth/callback')
-  @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Handle Google OAuth callback' })
   @ApiQuery({ name: 'code', description: 'Authorization code from Google' })
   @ApiQuery({ name: 'state', description: 'State parameter', required: false })
   @ApiResponse({
-    status: 200,
-    description: 'OAuth callback processed successfully',
+    status: 302,
+    description: 'Redirect to frontend with success/error status',
   })
   @ApiResponse({ status: 400, description: 'Invalid authorization code' })
   async oauthCallback(
     @Query('code') code: string,
     @Query('state') state: string,
-  ): Promise<any> {
-    if (!code) {
-      throw new BadRequestException('Missing authorization code');
+    @Res() res: any,
+  ): Promise<void> {
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+    
+    try {
+      if (!code) {
+        // Redirect to frontend with error - default to onboarding if no context
+        return res.redirect(`${frontendUrl}/onboarding?gmail_error=missing_code`);
+      }
+    
+      // Extract userId and context from state (format: userId_timestamp_random_context)
+      const stateParts = state ? state.split('_') : [];
+      const userId = stateParts[0] ? parseInt(stateParts[0], 10) : null;
+      const context = stateParts[3] || 'onboarding'; // Default to onboarding
+    
+      // Exchange code for tokens and store if userId provided
+      const tokens = await this.gmailService.exchangeCodeForTokens(code, userId || undefined);
+    
+      // Redirect based on context
+      if (context === 'dashboard') {
+        res.redirect(`${frontendUrl}/dashboard?gmail_success=true`);
+      } else {
+        // Default to onboarding for first-time users
+        res.redirect(`${frontendUrl}/onboarding?gmail_success=true`);
+      }
+    } catch (error) {
+      console.error('OAuth callback error:', error);
+      // Extract context for error redirect
+      const stateParts = state ? state.split('_') : [];
+      const context = stateParts[3] || 'onboarding';
+      
+      if (context === 'dashboard') {
+        res.redirect(`${frontendUrl}/dashboard?gmail_error=auth_failed`);
+      } else {
+        res.redirect(`${frontendUrl}/onboarding?gmail_error=auth_failed`);
+      }
     }
-  
-    // Extract userId from state (format: userId_timestamp_random)
-    const userId = state ? parseInt(state.split('_')[0], 10) : null;
-  
-    // Exchange code for tokens and store if userId provided
-    const tokens = await this.gmailService.exchangeCodeForTokens(code, userId || undefined);
-  
-    return {
-      message: "OAuth success",
-      tokens,
-      state,
-    };
+  }
+
+  /**
+   * Check Gmail connection status
+   */
+  @Get('status')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Check Gmail connection status' })
+  @ApiResponse({
+    status: 200,
+    description: 'Gmail connection status retrieved successfully',
+    type: TBaseDTO<{ connected: boolean; email?: string; lastSync?: string }>,
+  })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  async getGmailStatus(
+    @Request() req: any,
+  ): Promise<TBaseDTO<{ connected: boolean; email?: string; lastSync?: string }>> {
+    const userId = req.user.userId;
+    const status = await this.gmailService.getConnectionStatus(userId);
+    return new TBaseDTO<{ connected: boolean; email?: string; lastSync?: string }>(status);
   }
 
   /**

@@ -12,6 +12,9 @@ export class UserDto {
 
   @ApiProperty({ example: 'John Doe' })
   name: string;
+
+  @ApiProperty({ example: true })
+  isFirstLogin?: boolean;
 }
 
 /**

@@ -28,6 +28,9 @@ export class User {
   @Column({ nullable: true, unique: true })
   googleId?: string;
 
+  @Column({ default: true })
+  isFirstLogin: boolean;
+
   @CreateDateColumn()
   createdAt: Date;
 

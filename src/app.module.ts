@@ -9,6 +9,7 @@ import { KafkaModule } from './kafka/kafka.module';
 import { User } from './auth/entities/user.entity';
 import { RefreshToken } from './auth/entities/refresh-token.entity';
 import { EmailRaw } from './gmail/entities/email-raw.entity';
+import { GmailToken } from './gmail/entities/gmail-token.entity';
 import { EmailSummary } from './ai/entities/email-summary.entity';
 import { EmailMetadata } from './ai/entities/email-metadata.entity';
 
@@ -27,7 +28,7 @@ import { EmailMetadata } from './ai/entities/email-metadata.entity';
         username: configService.get<string>('DB_USERNAME', 'postgres'),
         password: configService.get<string>('DB_PASSWORD', 'postgres'),
         database: configService.get<string>('DB_NAME', 'email_auth_db'),
-        entities: [User, RefreshToken, EmailRaw, EmailSummary, EmailMetadata],
+        entities: [User, RefreshToken, EmailRaw, GmailToken, EmailSummary, EmailMetadata],
         synchronize: configService.get<string>('NODE_ENV') !== 'production', // Auto-sync in dev only
         logging: configService.get<string>('NODE_ENV') === 'development',
       }),

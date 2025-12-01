@@ -1,6 +1,7 @@
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
+import * as cookieParser from 'cookie-parser';
 import { AppModule } from './app.module';
 
 /**
@@ -9,10 +10,15 @@ import { AppModule } from './app.module';
 async function bootstrap(): Promise<void> {
   const app = await NestFactory.create(AppModule);
 
-  // Enable CORS for React frontend
+  // ✅ COOKIE PARSER - handle HttpOnly cookies
+  app.use(cookieParser());
+
+  // ✅ CORS with credentials for HttpOnly cookies
   app.enableCors({
     origin: process.env.FRONTEND_URL || 'http://localhost:3000',
-    credentials: true,
+    credentials: true, // ✅ CRITICAL: Allow cookies
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   });
 
   // Global validation pipe

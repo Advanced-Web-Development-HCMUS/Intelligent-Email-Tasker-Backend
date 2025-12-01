@@ -6,7 +6,10 @@ import {
   HttpStatus,
   UseGuards,
   Request,
+  UseInterceptors,
+  Res,
 } from '@nestjs/common';
+import { Response } from 'express';
 import {
   ApiTags,
   ApiOperation,
@@ -21,11 +24,13 @@ import { RefreshTokenDto } from './dto/refresh-token.dto';
 import { AuthResponseDto } from './dto/auth-response.dto';
 import { TBaseDTO } from '../common/dto/base.dto';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
+import { CookieAuthInterceptor } from '../common/interceptors/cookie-auth.interceptor';
 
 /**
  * Controller for authentication endpoints
  */
 @ApiTags('Authentication')
+@UseInterceptors(CookieAuthInterceptor)
 @Controller('auth')
 export class AuthController {
   constructor(private readonly authService: AuthService) {}
@@ -97,9 +102,19 @@ export class AuthController {
   })
   @ApiResponse({ status: 401, description: 'Invalid refresh token' })
   async refreshToken(
-    @Body() refreshTokenDto: RefreshTokenDto,
+    @Request() req: any,
   ): Promise<TBaseDTO<{ accessToken: string }>> {
-    return this.authService.refreshToken(refreshTokenDto);
+    const refreshToken = req.cookies?.refreshToken;
+    
+    if (!refreshToken) {
+      return new TBaseDTO<{ accessToken: string }>(
+        undefined,
+        undefined,
+        'Refresh token not found',
+      );
+    }
+
+    return this.authService.refreshToken({ refreshToken });
   }
 
   /**
@@ -116,9 +131,25 @@ export class AuthController {
     type: TBaseDTO<{ message: string }>,
   })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
-  async logout(@Request() req: any): Promise<TBaseDTO<{ message: string }>> {
-    // In a real implementation, you would revoke the refresh token here
-    // For this mock, we'll just return success
+  async logout(
+    @Request() req: any,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<TBaseDTO<{ message: string }>> {
+    const refreshToken = req.cookies?.refreshToken;
+    
+    if (refreshToken) {
+      // Revoke refresh token from database
+      await this.authService.revokeRefreshToken(refreshToken);
+    }
+
+    // Clear the refresh token cookie
+    res.clearCookie('refreshToken', {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      path: '/',
+    });
+
     return new TBaseDTO<{ message: string }>({ message: 'Logged out successfully' });
   }
 

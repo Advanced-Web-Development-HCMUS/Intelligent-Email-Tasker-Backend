@@ -5,8 +5,11 @@ import {
   HttpCode,
   HttpStatus,
   UseGuards,
+  UseInterceptors,
   Request,
+  Req,
 } from '@nestjs/common';
+import { Request as ExpressRequest } from 'express';
 import {
   ApiTags,
   ApiOperation,
@@ -18,9 +21,10 @@ import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
 import { GoogleLoginDto } from './dto/google-login.dto';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
-import { AuthResponseDto } from './dto/auth-response.dto';
+import { AuthResponseDto, PublicAuthResponseDto } from './dto/auth-response.dto';
 import { TBaseDTO } from '../common/dto/base.dto';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
+import { CookieAuthInterceptor } from './interceptors/cookie-auth.interceptor';
 
 /**
  * Controller for authentication endpoints
@@ -34,12 +38,13 @@ export class AuthController {
    * Register a new user account
    */
   @Post('register')
+  @UseInterceptors(CookieAuthInterceptor)
   @HttpCode(HttpStatus.CREATED)
   @ApiOperation({ summary: 'Register a new user account' })
   @ApiResponse({
     status: 201,
     description: 'Registration successful',
-    type: TBaseDTO<AuthResponseDto>,
+    type: TBaseDTO<PublicAuthResponseDto>,
   })
   @ApiResponse({ status: 400, description: 'Email already registered or validation error' })
   async register(
@@ -52,12 +57,13 @@ export class AuthController {
    * Login with email and password
    */
   @Post('login')
+  @UseInterceptors(CookieAuthInterceptor)
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Login with email and password' })
   @ApiResponse({
     status: 200,
     description: 'Login successful',
-    type: TBaseDTO<AuthResponseDto>,
+    type: TBaseDTO<PublicAuthResponseDto>,
   })
   @ApiResponse({ status: 401, description: 'Invalid credentials' })
   async login(
@@ -70,12 +76,13 @@ export class AuthController {
    * Login with Google OAuth
    */
   @Post('google')
+  @UseInterceptors(CookieAuthInterceptor)
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Login with Google OAuth' })
   @ApiResponse({
     status: 200,
     description: 'Google login successful',
-    type: TBaseDTO<AuthResponseDto>,
+    type: TBaseDTO<PublicAuthResponseDto>,
   })
   @ApiResponse({ status: 401, description: 'Invalid Google token' })
   async googleLogin(
@@ -97,9 +104,19 @@ export class AuthController {
   })
   @ApiResponse({ status: 401, description: 'Invalid refresh token' })
   async refreshToken(
-    @Body() refreshTokenDto: RefreshTokenDto,
+    @Req() req: ExpressRequest,
   ): Promise<TBaseDTO<{ accessToken: string }>> {
-    return this.authService.refreshToken(refreshTokenDto);
+    const refreshToken = req.cookies?.refreshToken;
+    
+    if (!refreshToken) {
+      return new TBaseDTO<{ accessToken: string }>(
+        undefined,
+        undefined,
+        'No refresh token provided',
+      );
+    }
+
+    return this.authService.refreshToken({ refreshToken });
   }
 
   /**
@@ -116,9 +133,28 @@ export class AuthController {
     type: TBaseDTO<{ message: string }>,
   })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
-  async logout(@Request() req: any): Promise<TBaseDTO<{ message: string }>> {
-    // In a real implementation, you would revoke the refresh token here
-    // For this mock, we'll just return success
+  async logout(
+    @Request() req: any,
+    @Req() request: ExpressRequest,
+  ): Promise<TBaseDTO<{ message: string }>> {
+    const refreshToken = request.cookies?.refreshToken;
+    
+    // Revoke refresh token if exists
+    if (refreshToken) {
+      await this.authService.revokeRefreshToken(refreshToken);
+    }
+    
+    // Clear refresh token cookie
+    const response = request.res;
+    if (response) {
+      response.clearCookie('refreshToken', {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'strict',
+        path: '/',
+      });
+    }
+    
     return new TBaseDTO<{ message: string }>({ message: 'Logged out successfully' });
   }
 

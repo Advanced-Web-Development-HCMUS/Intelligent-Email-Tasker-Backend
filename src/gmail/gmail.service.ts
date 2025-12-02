@@ -138,6 +138,40 @@ export class GmailService {
   }
 
   /**
+   * Check Gmail connection status for a user
+   */
+  async getConnectionStatus(userId: number): Promise<{ connected: boolean; email?: string }> {
+    try {
+      const token = await this.gmailTokenRepository.findOne({
+        where: { userId },
+      });
+
+      if (!token || !token.refreshToken) {
+        return { connected: false };
+      }
+
+      // Try to get a valid access token (this will refresh if needed)
+      try {
+        await this.getValidAccessToken(userId);
+        
+        // If successful, try to get user profile to confirm connection
+        const gmail = await this.getGmailClient(userId);
+        const profile = await gmail.users.getProfile({ userId: 'me' });
+        
+        return { 
+          connected: true, 
+          email: profile.data.emailAddress 
+        };
+      } catch (error) {
+        // If token refresh fails, connection is invalid
+        return { connected: false };
+      }
+    } catch (error) {
+      return { connected: false };
+    }
+  }
+
+  /**
    * Get valid access token for user (refresh if needed)
    */
   async getValidAccessToken(userId: number): Promise<string> {

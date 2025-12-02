@@ -24,6 +24,7 @@ import {
 } from '@nestjs/swagger';
 import { GmailService } from './gmail.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { AuthService } from '../auth/auth.service';
 import { FetchEmailsDto } from './dto/fetch-emails.dto';
 import { OAuthCallbackDto } from './dto/oauth-callback.dto';
 import { SendEmailDto } from './dto/send-email.dto';
@@ -38,10 +39,31 @@ import { GGJParseIntPipe } from '../common/pipes/parse-int.pipe';
 @ApiTags('Gmail')
 @Controller('gmail')
 export class GmailController {
-  constructor(private readonly gmailService: GmailService) {}
+  constructor(
+    private readonly gmailService: GmailService,
+    private readonly authService: AuthService,
+  ) {}
 
   /**
-   * Generate OAuth authorization URL
+   * Start OAuth process and redirect to Google
+   */
+  @Get('auth/google')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
+  @ApiOperation({ summary: 'Start Google OAuth process and redirect to Google' })
+  @ApiResponse({ status: 302, description: 'Redirect to Google OAuth' })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  async startGoogleAuth(
+    @Request() req: any,
+    @Res() res: Response,
+  ): Promise<void> {
+    const userId = req.user.userId;
+    const { url } = this.gmailService.generateAuthUrl(userId);
+    res.redirect(url);
+  }
+
+  /**
+   * Generate OAuth authorization URL (API endpoint)
    */
   @Get('oauth/url')
   @UseGuards(JwtAuthGuard)
@@ -66,34 +88,85 @@ export class GmailController {
    * Handle OAuth callback (redirect from Google)
    */
   @Get('oauth/callback')
-  @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Handle Google OAuth callback' })
   @ApiQuery({ name: 'code', description: 'Authorization code from Google' })
   @ApiQuery({ name: 'state', description: 'State parameter', required: false })
-  @ApiResponse({
-    status: 200,
-    description: 'OAuth callback processed successfully',
-  })
-  @ApiResponse({ status: 400, description: 'Invalid authorization code' })
+  @ApiQuery({ name: 'error', description: 'Error from Google OAuth', required: false })
+  @ApiResponse({ status: 302, description: 'Redirect to frontend' })
+  @ApiResponse({ status: 400, description: 'OAuth error' })
   async oauthCallback(
     @Query('code') code: string,
     @Query('state') state: string,
-  ): Promise<any> {
-    if (!code) {
-      throw new BadRequestException('Missing authorization code');
+    @Query('error') error: string,
+    @Res() res: Response,
+  ): Promise<void> {
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+    
+    try {
+      // Handle OAuth error from Google
+      if (error) {
+        const errorUrl = `${frontendUrl}/oauth/callback?error=oauth_denied`;
+        return res.redirect(errorUrl);
+      }
+
+      if (!code) {
+        const errorUrl = `${frontendUrl}/oauth/callback?error=missing_code`;
+        return res.redirect(errorUrl);
+      }
+
+      // Extract userId from state (format: userId_timestamp_random)
+      const userId = state ? parseInt(state.split('_')[0], 10) : null;
+      
+      if (!userId) {
+        const errorUrl = `${frontendUrl}/oauth/callback?error=invalid_state`;
+        return res.redirect(errorUrl);
+      }
+
+      // Exchange code for tokens and store
+      await this.gmailService.exchangeCodeForTokens(code, userId);
+
+      // Generate new JWT access token for the user
+      const user = await this.authService.validateUser(userId);
+      if (!user) {
+        const errorUrl = `${frontendUrl}/oauth/callback?error=user_not_found`;
+        return res.redirect(errorUrl);
+      }
+
+      // Generate new access token
+      const payload = { sub: user.id, email: user.email };
+      const accessToken = this.authService.generateAccessToken(payload);
+
+      // Redirect to frontend with access token
+      const successUrl = `${frontendUrl}/oauth/callback?accessToken=${accessToken}`;
+      res.redirect(successUrl);
+      
+    } catch (error) {
+      console.error('OAuth callback error:', error);
+      const errorUrl = `${frontendUrl}/oauth/callback?error=processing_failed`;
+      res.redirect(errorUrl);
     }
-  
-    // Extract userId from state (format: userId_timestamp_random)
-    const userId = state ? parseInt(state.split('_')[0], 10) : null;
-  
-    // Exchange code for tokens and store if userId provided
-    const tokens = await this.gmailService.exchangeCodeForTokens(code, userId || undefined);
-  
-    return {
-      message: "OAuth success",
-      tokens,
-      state,
-    };
+  }
+
+  /**
+   * Check Gmail connection status
+   */
+  @Get('connection/status')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Check Gmail connection status' })
+  @ApiResponse({
+    status: 200,
+    description: 'Connection status retrieved successfully',
+    type: TBaseDTO<{ connected: boolean; email?: string }>,
+  })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  async getConnectionStatus(
+    @Request() req: any,
+  ): Promise<TBaseDTO<{ connected: boolean; email?: string }>> {
+    const userId = req.user.userId;
+    const status = await this.gmailService.getConnectionStatus(userId);
+    return new TBaseDTO<{ connected: boolean; email?: string }>(status);
   }
 
   /**

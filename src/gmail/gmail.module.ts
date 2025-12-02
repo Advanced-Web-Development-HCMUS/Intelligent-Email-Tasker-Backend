@@ -6,11 +6,13 @@ import { EmailRaw } from './entities/email-raw.entity';
 import { GmailToken } from './entities/gmail-token.entity';
 import { User } from '../auth/entities/user.entity';
 import { KafkaModule } from '../kafka/kafka.module';
+import { AuthModule } from '../auth/auth.module';
 
 @Module({
   imports: [
     TypeOrmModule.forFeature([EmailRaw, GmailToken, User]),
     KafkaModule,
+    AuthModule,
   ],
   controllers: [GmailController],
   providers: [GmailService],

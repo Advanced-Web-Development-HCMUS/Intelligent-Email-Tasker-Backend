@@ -353,6 +353,16 @@ export class AuthService implements OnModuleInit {
   }
 
   /**
+   * Generate access token for OAuth callback
+   */
+  generateAccessToken(payload: { sub: number; email: string }): string {
+    return this.jwtService.sign(payload, {
+      secret: process.env.JWT_SECRET || 'secret-key',
+      expiresIn: this.ACCESS_TOKEN_EXPIRY,
+    });
+  }
+
+  /**
    * Revoke refresh token (on logout)
    */
   async revokeRefreshToken(refreshToken: string): Promise<void> {

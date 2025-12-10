@@ -5,7 +5,9 @@ import { google } from 'googleapis';
 import { EmailRaw } from './entities/email-raw.entity';
 import { GmailToken } from './entities/gmail-token.entity';
 import { User } from '../auth/entities/user.entity';
+import { EmailSummary } from '../ai/entities/email-summary.entity';
 import { KafkaService } from '../kafka/kafka.service';
+import { KanbanStatus } from './dto/update-email-status.dto';
 
 /**
  * Service for Gmail integration
@@ -21,6 +23,8 @@ export class GmailService {
     private readonly gmailTokenRepository: Repository<GmailToken>,
     @InjectRepository(User)
     private readonly userRepository: Repository<User>,
+    @InjectRepository(EmailSummary)
+    private readonly emailSummaryRepository: Repository<EmailSummary>,
     private readonly kafkaService: KafkaService,
   ) {}
 
@@ -408,6 +412,8 @@ export class GmailService {
               receivedAt: internalDate,
               sentAt: sentAt,
               rawData: JSON.stringify(msg),
+              status: 'inbox', // Set default status for new emails
+              snoozeUntil: null, // No snooze initially
             });
 
             const savedEmail = await this.emailRawRepository.save(emailRaw);
@@ -661,26 +667,45 @@ export class GmailService {
       .take(limit)
       .getMany();
 
-    // Format emails for response
-    const formattedEmails = emails.map((email) => ({
-      id: email.id,
-      gmailId: email.gmailId,
-      threadId: email.threadId,
-      from: email.from,
-      fromName: email.fromName,
-      to: email.to ? JSON.parse(email.to) : [],
-      cc: email.cc ? JSON.parse(email.cc) : [],
-      bcc: email.bcc ? JSON.parse(email.bcc) : [],
-      subject: email.subject,
-      snippet: email.snippet,
-      isRead: email.isRead,
-      isStarred: email.isStarred,
-      isImportant: email.isImportant,
-      labels: email.labels ? JSON.parse(email.labels) : [],
-      receivedAt: email.receivedAt,
-      sentAt: email.sentAt,
-      createdAt: email.createdAt,
-    }));
+    // Format emails for response with summaries
+    const formattedEmails = await Promise.all(
+      emails.map(async (email) => {
+        const summary = await this.emailSummaryRepository.findOne({
+          where: { emailRawId: email.id },
+        });
+
+        return {
+          id: email.id,
+          gmailId: email.gmailId,
+          threadId: email.threadId,
+          from: email.from,
+          fromName: email.fromName,
+          to: email.to ? JSON.parse(email.to) : [],
+          cc: email.cc ? JSON.parse(email.cc) : [],
+          bcc: email.bcc ? JSON.parse(email.bcc) : [],
+          subject: email.subject,
+          snippet: email.snippet,
+          isRead: email.isRead,
+          isStarred: email.isStarred,
+          isImportant: email.isImportant,
+          labels: email.labels ? JSON.parse(email.labels) : [],
+          receivedAt: email.receivedAt,
+          sentAt: email.sentAt,
+          createdAt: email.createdAt,
+          status: email.status || 'inbox',
+          snoozeUntil: email.snoozeUntil,
+          summary: summary
+            ? {
+                summary: summary.summary,
+                keyPoints: summary.keyPoints ? JSON.parse(summary.keyPoints) : [],
+                sentiment: summary.sentiment,
+                category: summary.category,
+                priority: summary.priority,
+              }
+            : null,
+        };
+      }),
+    );
 
     return {
       emails: formattedEmails,
@@ -692,22 +717,14 @@ export class GmailService {
   }
 
   /**
-   * Get email detail by ID
+   * Helper method to enrich email with summary
    */
-  async getEmailDetail(userId: number, emailId: number): Promise<any | null> {
-    const email = await this.emailRawRepository.findOne({
-      where: {
-        id: emailId,
-        userId,
-      },
+  private async enrichEmailWithSummary(email: EmailRaw): Promise<any> {
+    const summary = await this.emailSummaryRepository.findOne({
+      where: { emailRawId: email.id },
     });
 
-    if (!email) {
-      return null;
-    }
-
-    // Parse JSON fields
-    return {
+    const baseEmail = {
       id: email.id,
       gmailId: email.gmailId,
       threadId: email.threadId,
@@ -729,7 +746,38 @@ export class GmailService {
       rawData: email.rawData ? JSON.parse(email.rawData) : null,
       createdAt: email.createdAt,
       updatedAt: email.updatedAt,
+      status: email.status || 'inbox',
+      snoozeUntil: email.snoozeUntil,
+      summary: summary
+        ? {
+            summary: summary.summary,
+            keyPoints: summary.keyPoints ? JSON.parse(summary.keyPoints) : [],
+            sentiment: summary.sentiment,
+            category: summary.category,
+            priority: summary.priority,
+          }
+        : null,
     };
+
+    return baseEmail;
+  }
+
+  /**
+   * Get email detail by ID
+   */
+  async getEmailDetail(userId: number, emailId: number): Promise<any | null> {
+    const email = await this.emailRawRepository.findOne({
+      where: {
+        id: emailId,
+        userId,
+      },
+    });
+
+    if (!email) {
+      return null;
+    }
+
+    return await this.enrichEmailWithSummary(email);
   }
 
   /**
@@ -739,7 +787,7 @@ export class GmailService {
     userId: number,
     page: number = 1,
     limit: number = 20,
-  ): Promise<{ emails: EmailRaw[]; total: number; page: number; limit: number }> {
+  ): Promise<{ emails: any[]; total: number; page: number; limit: number }> {
     const [emails, total] = await this.emailRawRepository.findAndCount({
       where: { userId },
       order: { receivedAt: 'DESC' },
@@ -747,8 +795,13 @@ export class GmailService {
       take: limit,
     });
 
+    // Enrich emails with summaries
+    const enrichedEmails = await Promise.all(
+      emails.map(async (email) => await this.enrichEmailWithSummary(email)),
+    );
+
     return {
-      emails,
+      emails: enrichedEmails,
       total,
       page,
       limit,
@@ -1075,6 +1128,225 @@ export class GmailService {
         error: error.message || 'Failed to get attachment',
       };
     }
+  }
+
+  /**
+   * Update email status (for Kanban drag-and-drop)
+   */
+  async updateEmailStatus(
+    userId: number,
+    emailId: number,
+    status: KanbanStatus,
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      const email = await this.emailRawRepository.findOne({
+        where: { id: emailId, userId },
+      });
+
+      if (!email) {
+        return { success: false, error: 'Email not found' };
+      }
+
+      email.status = status;
+      // If moving out of snoozed, clear snoozeUntil
+      if (status !== KanbanStatus.SNOOZED) {
+        email.snoozeUntil = null;
+      }
+
+      await this.emailRawRepository.save(email);
+
+      return { success: true };
+    } catch (error: any) {
+      console.error('Update email status error:', error);
+      return {
+        success: false,
+        error: error.message || 'Failed to update email status',
+      };
+    }
+  }
+
+  /**
+   * Snooze an email until a specific date
+   */
+  async snoozeEmail(
+    userId: number,
+    emailId: number,
+    snoozeUntil: Date,
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      const email = await this.emailRawRepository.findOne({
+        where: { id: emailId, userId },
+      });
+
+      if (!email) {
+        return { success: false, error: 'Email not found' };
+      }
+
+      if (snoozeUntil <= new Date()) {
+        return { success: false, error: 'Snooze date must be in the future' };
+      }
+
+      email.status = KanbanStatus.SNOOZED;
+      email.snoozeUntil = snoozeUntil;
+
+      await this.emailRawRepository.save(email);
+
+      return { success: true };
+    } catch (error: any) {
+      console.error('Snooze email error:', error);
+      return {
+        success: false,
+        error: error.message || 'Failed to snooze email',
+      };
+    }
+  }
+
+  /**
+   * Get emails by Kanban status/column
+   */
+  async getEmailsByStatus(
+    userId: number,
+    status: KanbanStatus,
+    page: number = 1,
+    limit: number = 50,
+  ): Promise<{
+    emails: any[];
+    total: number;
+    page: number;
+    limit: number;
+    status: string;
+  }> {
+    const skip = (page - 1) * limit;
+
+    // Build query
+    const queryBuilder = this.emailRawRepository
+      .createQueryBuilder('email')
+      .where('email.userId = :userId', { userId })
+      .andWhere('email.status = :status', { status });
+
+    // For snoozed emails, only show those that are still snoozed
+    if (status === KanbanStatus.SNOOZED) {
+      queryBuilder.andWhere('email.snoozeUntil > :now', { now: new Date() });
+    } else {
+      // For other statuses, exclude snoozed emails that are still snoozed
+      queryBuilder.andWhere(
+        '(email.snoozeUntil IS NULL OR email.snoozeUntil <= :now)',
+        { now: new Date() },
+      );
+    }
+
+    // Get total count
+    const total = await queryBuilder.getCount();
+
+    // Get emails with pagination
+    const emails = await queryBuilder
+      .orderBy('email.receivedAt', 'DESC')
+      .addOrderBy('email.sentAt', 'DESC')
+      .skip(skip)
+      .take(limit)
+      .getMany();
+
+    // Format emails with summaries
+    const formattedEmails = await Promise.all(
+      emails.map(async (email) => {
+        const summary = await this.emailSummaryRepository.findOne({
+          where: { emailRawId: email.id },
+        });
+
+        return {
+          id: email.id,
+          gmailId: email.gmailId,
+          threadId: email.threadId,
+          from: email.from,
+          fromName: email.fromName,
+          to: email.to ? JSON.parse(email.to) : [],
+          cc: email.cc ? JSON.parse(email.cc) : [],
+          bcc: email.bcc ? JSON.parse(email.bcc) : [],
+          subject: email.subject,
+          snippet: email.snippet,
+          isRead: email.isRead,
+          isStarred: email.isStarred,
+          isImportant: email.isImportant,
+          labels: email.labels ? JSON.parse(email.labels) : [],
+          receivedAt: email.receivedAt,
+          sentAt: email.sentAt,
+          createdAt: email.createdAt,
+          status: email.status || 'inbox',
+          snoozeUntil: email.snoozeUntil,
+          summary: summary
+            ? {
+                summary: summary.summary,
+                keyPoints: summary.keyPoints ? JSON.parse(summary.keyPoints) : [],
+                sentiment: summary.sentiment,
+                category: summary.category,
+                priority: summary.priority,
+              }
+            : null,
+        };
+      }),
+    );
+
+    return {
+      emails: formattedEmails,
+      total,
+      page,
+      limit,
+      status,
+    };
+  }
+
+  /**
+   * Get Kanban board with all columns
+   */
+  async getKanbanBoard(userId: number): Promise<{
+    columns: Array<{
+      id: string;
+      name: string;
+      emails: any[];
+      count: number;
+    }>;
+  }> {
+    const statuses: Array<{ id: KanbanStatus; name: string }> = [
+      { id: KanbanStatus.INBOX, name: 'Inbox' },
+      { id: KanbanStatus.TODO, name: 'To Do' },
+      { id: KanbanStatus.IN_PROGRESS, name: 'In Progress' },
+      { id: KanbanStatus.DONE, name: 'Done' },
+      { id: KanbanStatus.SNOOZED, name: 'Snoozed' },
+    ];
+
+    const columns = await Promise.all(
+      statuses.map(async (status) => {
+        const result = await this.getEmailsByStatus(userId, status.id, 1, 100);
+        return {
+          id: status.id,
+          name: status.name,
+          emails: result.emails,
+          count: result.total,
+        };
+      }),
+    );
+
+    return { columns };
+  }
+
+  /**
+   * Restore snoozed emails that have passed their snooze date
+   * This should be called periodically by a scheduled task
+   */
+  async restoreSnoozedEmails(): Promise<{ restored: number }> {
+    const now = new Date();
+    const result = await this.emailRawRepository
+      .createQueryBuilder()
+      .update(EmailRaw)
+      .set({
+        status: KanbanStatus.INBOX,
+        snoozeUntil: null,
+      })
+      .where('status = :status', { status: KanbanStatus.SNOOZED })
+      .andWhere('snoozeUntil <= :now', { now })
+      .execute();
+
+    return { restored: result.affected || 0 };
   }
 }
 

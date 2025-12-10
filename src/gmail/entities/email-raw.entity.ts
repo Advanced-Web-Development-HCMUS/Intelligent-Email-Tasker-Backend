@@ -78,6 +78,16 @@ export class EmailRaw {
   @Column({ type: 'text', nullable: true })
   rawData: string; // Full raw email data (JSON)
 
+  @Column({
+    type: 'varchar',
+    length: 50,
+    default: 'inbox',
+  })
+  status: string; // Kanban status: 'inbox', 'todo', 'in_progress', 'done', 'snoozed'
+
+  @Column({ type: 'timestamp', nullable: true })
+  snoozeUntil: Date; // When to restore snoozed email
+
   @CreateDateColumn()
   createdAt: Date;
 

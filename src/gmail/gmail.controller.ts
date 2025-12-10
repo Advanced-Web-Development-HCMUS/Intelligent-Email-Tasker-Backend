@@ -29,6 +29,8 @@ import { OAuthCallbackDto } from './dto/oauth-callback.dto';
 import { SendEmailDto } from './dto/send-email.dto';
 import { ReplyEmailDto } from './dto/reply-email.dto';
 import { ModifyEmailDto } from './dto/modify-email.dto';
+import { UpdateEmailStatusDto, KanbanStatus } from './dto/update-email-status.dto';
+import { SnoozeEmailDto } from './dto/snooze-email.dto';
 import { TBaseDTO } from '../common/dto/base.dto';
 import { GGJParseIntPipe } from '../common/pipes/parse-int.pipe';
 
@@ -521,6 +523,186 @@ export class GmailController {
         error: result.error || 'Attachment not found',
       });
     }
+  }
+
+  /**
+   * Update email status (for Kanban drag-and-drop)
+   */
+  @Post('emails/:id/status')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Update email status for Kanban board' })
+  @ApiParam({ name: 'id', description: 'Email ID', type: Number, example: 1 })
+  @ApiResponse({
+    status: 200,
+    description: 'Email status updated successfully',
+    type: TBaseDTO<{ success: boolean }>,
+  })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 404, description: 'Email not found' })
+  async updateEmailStatus(
+    @Request() req: any,
+    @Param('id', GGJParseIntPipe) emailId: number,
+    @Body() updateStatusDto: UpdateEmailStatusDto,
+  ): Promise<TBaseDTO<{ success: boolean }>> {
+    const userId = req.user.userId;
+    const result = await this.gmailService.updateEmailStatus(
+      userId,
+      emailId,
+      updateStatusDto.status,
+    );
+
+    if (result.success) {
+      return new TBaseDTO<{ success: boolean }>({ success: true });
+    } else {
+      return new TBaseDTO<{ success: boolean }>(
+        undefined,
+        undefined,
+        result.error || 'Failed to update email status',
+      );
+    }
+  }
+
+  /**
+   * Snooze an email
+   */
+  @Post('emails/:id/snooze')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Snooze an email until a specific date' })
+  @ApiParam({ name: 'id', description: 'Email ID', type: Number, example: 1 })
+  @ApiResponse({
+    status: 200,
+    description: 'Email snoozed successfully',
+    type: TBaseDTO<{ success: boolean }>,
+  })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 404, description: 'Email not found' })
+  async snoozeEmail(
+    @Request() req: any,
+    @Param('id', GGJParseIntPipe) emailId: number,
+    @Body() snoozeEmailDto: SnoozeEmailDto,
+  ): Promise<TBaseDTO<{ success: boolean }>> {
+    const userId = req.user.userId;
+    const result = await this.gmailService.snoozeEmail(
+      userId,
+      emailId,
+      snoozeEmailDto.snoozeUntil,
+    );
+
+    if (result.success) {
+      return new TBaseDTO<{ success: boolean }>({ success: true });
+    } else {
+      return new TBaseDTO<{ success: boolean }>(
+        undefined,
+        undefined,
+        result.error || 'Failed to snooze email',
+      );
+    }
+  }
+
+  /**
+   * Get emails by Kanban status/column
+   */
+  @Get('kanban/columns/:status')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Get emails by Kanban status/column' })
+  @ApiParam({
+    name: 'status',
+    description: 'Kanban status',
+    enum: KanbanStatus,
+    example: KanbanStatus.INBOX,
+  })
+  @ApiQuery({ name: 'page', required: false, type: Number, description: 'Page number (default: 1)' })
+  @ApiQuery({ name: 'limit', required: false, type: Number, description: 'Items per page (default: 50, max: 100)' })
+  @ApiResponse({
+    status: 200,
+    description: 'Emails retrieved successfully',
+    type: TBaseDTO<{ emails: any[]; total: number; page: number; limit: number; status: string }>,
+  })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  async getEmailsByStatus(
+    @Request() req: any,
+    @Param('status') status: KanbanStatus,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+  ): Promise<TBaseDTO<{ emails: any[]; total: number; page: number; limit: number; status: string }>> {
+    const userId = req.user.userId;
+    const pageNum = page ? parseInt(page, 10) : 1;
+    const limitNum = limit ? Math.min(parseInt(limit, 10), 100) : 50;
+
+    if (pageNum < 1 || limitNum < 1) {
+      return new TBaseDTO<{ emails: any[]; total: number; page: number; limit: number; status: string }>(
+        undefined,
+        undefined,
+        'Page and limit must be positive numbers',
+      );
+    }
+
+    // Validate status
+    if (!Object.values(KanbanStatus).includes(status)) {
+      return new TBaseDTO<{ emails: any[]; total: number; page: number; limit: number; status: string }>(
+        undefined,
+        undefined,
+        'Invalid status. Must be one of: inbox, todo, in_progress, done, snoozed',
+      );
+    }
+
+    const result = await this.gmailService.getEmailsByStatus(
+      userId,
+      status,
+      pageNum,
+      limitNum,
+    );
+
+    return new TBaseDTO<{ emails: any[]; total: number; page: number; limit: number; status: string }>(result);
+  }
+
+  /**
+   * Get full Kanban board with all columns
+   */
+  @Get('kanban/board')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Get full Kanban board with all columns' })
+  @ApiResponse({
+    status: 200,
+    description: 'Kanban board retrieved successfully',
+    type: TBaseDTO<{
+      columns: Array<{
+        id: string;
+        name: string;
+        emails: any[];
+        count: number;
+      }>;
+    }>,
+  })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  async getKanbanBoard(
+    @Request() req: any,
+  ): Promise<TBaseDTO<{
+    columns: Array<{
+      id: string;
+      name: string;
+      emails: any[];
+      count: number;
+    }>;
+  }>> {
+    const userId = req.user.userId;
+    const result = await this.gmailService.getKanbanBoard(userId);
+    return new TBaseDTO<{
+      columns: Array<{
+        id: string;
+        name: string;
+        emails: any[];
+        count: number;
+      }>;
+    }>(result);
   }
 }
 

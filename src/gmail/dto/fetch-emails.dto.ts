@@ -1,27 +1,10 @@
-import { IsNotEmpty, IsString, IsOptional, IsNumber, Min, Max } from 'class-validator';
+import { IsOptional, IsNumber, Min, Max } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 
 /**
  * DTO for fetching Gmail emails
  */
 export class FetchEmailsDto {
-  @ApiProperty({
-    description: 'Google OAuth access token',
-    example: 'ya29.a0AfH6SMBx...',
-  })
-  @IsString()
-  @IsOptional()
-  accessToken?: string;
-
-  @ApiProperty({
-    description: 'Google OAuth refresh token (optional)',
-    example: '1//0g...',
-    required: false,
-  })
-  @IsString()
-  @IsOptional()
-  refreshToken?: string;
-
   @ApiProperty({
     description: 'Maximum number of emails to fetch',
     example: 50,
@@ -36,4 +19,3 @@ export class FetchEmailsDto {
   @Max(500)
   maxResults?: number;
 }
-

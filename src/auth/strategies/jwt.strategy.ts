@@ -2,15 +2,25 @@ import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { PassportStrategy } from '@nestjs/passport';
 import { ExtractJwt, Strategy } from 'passport-jwt';
 import { AuthService } from '../auth.service';
+import { Request } from 'express';
 
 /**
  * JWT Strategy for passport authentication
+ * Supports token extraction from:
+ * 1. Authorization header (Bearer token) - preferred
+ * 2. Query parameter (?token=...) - for redirects where headers can't be set
  */
 @Injectable()
 export class JwtStrategy extends PassportStrategy(Strategy) {
   constructor(private readonly authService: AuthService) {
     super({
-      jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
+      jwtFromRequest: ExtractJwt.fromExtractors([
+        ExtractJwt.fromAuthHeaderAsBearerToken(),
+        (request: Request) => {
+          // Extract from query parameter if not in header
+          return (request.query?.token as string) || null;
+        },
+      ]),
       ignoreExpiration: false,
       secretOrKey: process.env.JWT_SECRET || 'secret-key',
     });
@@ -27,4 +37,3 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     return { userId: user.id, email: user.email, name: user.name };
   }
 }
-

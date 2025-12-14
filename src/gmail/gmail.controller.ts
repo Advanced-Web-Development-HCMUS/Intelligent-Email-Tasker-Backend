@@ -10,8 +10,8 @@ import {
   HttpCode,
   HttpStatus,
   Res,
-  BadRequestException,
   Param,
+  Req,
 } from '@nestjs/common';
 import { Response } from 'express';
 import {
@@ -21,11 +21,11 @@ import {
   ApiBearerAuth,
   ApiQuery,
   ApiParam,
+  ApiExcludeEndpoint,
 } from '@nestjs/swagger';
 import { GmailService } from './gmail.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { FetchEmailsDto } from './dto/fetch-emails.dto';
-import { OAuthCallbackDto } from './dto/oauth-callback.dto';
 import { SendEmailDto } from './dto/send-email.dto';
 import { ReplyEmailDto } from './dto/reply-email.dto';
 import { ModifyEmailDto } from './dto/modify-email.dto';
@@ -33,6 +33,8 @@ import { UpdateEmailStatusDto, KanbanStatus } from './dto/update-email-status.dt
 import { SnoozeEmailDto } from './dto/snooze-email.dto';
 import { TBaseDTO } from '../common/dto/base.dto';
 import { GGJParseIntPipe } from '../common/pipes/parse-int.pipe';
+import { google } from 'googleapis';
+import { ConfigService } from '@nestjs/config';
 
 /**
  * Controller for Gmail integration endpoints
@@ -40,94 +42,223 @@ import { GGJParseIntPipe } from '../common/pipes/parse-int.pipe';
 @ApiTags('Gmail')
 @Controller('gmail')
 export class GmailController {
-  constructor(private readonly gmailService: GmailService) {}
+  constructor(
+    private readonly gmailService: GmailService,
+    private readonly configService: ConfigService,
+  ) {}
 
   /**
-   * Generate OAuth authorization URL
+   * Initiate Gmail OAuth flow
+   * Redirects user to Google consent screen
+   * Accepts JWT token via query parameter since redirect doesn't support headers
    */
-  @Get('oauth/url')
+  @Get('auth')
   @UseGuards(JwtAuthGuard)
   @ApiBearerAuth('JWT-auth')
-  @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: 'Get Google OAuth authorization URL' })
+  @ApiOperation({
+    summary: 'Initiate Gmail OAuth2 flow',
+    description:
+      'Redirects user to Google OAuth2 consent screen for Gmail access',
+  })
+  @ApiQuery({
+    name: 'token',
+    required: false,
+    description: 'JWT access token (alternative to Authorization header)',
+  })
   @ApiResponse({
-    status: 200,
-    description: 'Authorization URL generated successfully',
-    type: TBaseDTO<{ url: string; state: string }>,
+    status: 302,
+    description: 'Redirects to Google OAuth consent screen',
   })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
-  async getAuthUrl(
-    @Request() req: any,
-  ): Promise<TBaseDTO<{ url: string; state: string }>> {
+  async initiateGmailAuth(
+    @Req() req: any,
+    @Res() res: Response,
+  ): Promise<void> {
     const userId = req.user.userId;
-    const result = this.gmailService.generateAuthUrl(userId);
-    return new TBaseDTO<{ url: string; state: string }>(result);
+
+    // Create OAuth2 client
+    const oauth2Client = new google.auth.OAuth2(
+      this.configService.get<string>('GOOGLE_CLIENT_ID'),
+      this.configService.get<string>('GOOGLE_CLIENT_SECRET'),
+      `${this.configService.get<string>('GOOGLE_REDIRECT_URI')}`,
+    );
+
+    // Generate auth URL with Gmail scopes
+    const authUrl = oauth2Client.generateAuthUrl({
+      access_type: 'offline',
+      scope: [
+        'https://www.googleapis.com/auth/gmail.readonly',
+        'https://www.googleapis.com/auth/gmail.send',
+        'https://www.googleapis.com/auth/gmail.modify',
+        'https://www.googleapis.com/auth/userinfo.email',
+        'https://www.googleapis.com/auth/userinfo.profile',
+      ],
+      state: userId.toString(), // Pass userId in state to retrieve after callback
+      prompt: 'consent',
+    });
+
+    res.redirect(authUrl);
   }
 
   /**
-   * Handle OAuth callback (redirect from Google)
+   * Gmail OAuth callback
+   * Handles the callback from Google after user authorizes
    */
-  @Get('oauth/callback')
-  @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: 'Handle Google OAuth callback' })
-  @ApiQuery({ name: 'code', description: 'Authorization code from Google' })
-  @ApiQuery({ name: 'state', description: 'State parameter', required: false })
-  @ApiResponse({
-    status: 200,
-    description: 'OAuth callback processed successfully',
-  })
-  @ApiResponse({ status: 400, description: 'Invalid authorization code' })
-  async oauthCallback(
+  @Get('callback')
+  @ApiExcludeEndpoint()
+  async handleGmailCallback(
     @Query('code') code: string,
     @Query('state') state: string,
-  ): Promise<any> {
-    if (!code) {
-      throw new BadRequestException('Missing authorization code');
+    @Res() res: Response,
+  ): Promise<void> {
+    const frontendUrl =
+      this.configService.get<string>('FRONTEND_URL') || 'http://localhost:5173';
+
+    try {
+      if (!code) {
+        return res.redirect(`${frontendUrl}/dashboard?gmail_error=no_code`);
+      }
+
+      const userId = parseInt(state, 10);
+      if (!userId || isNaN(userId)) {
+        return res.redirect(
+          `${frontendUrl}/dashboard?gmail_error=invalid_state`,
+        );
+      }
+
+      // Exchange authorization code for tokens
+      const oauth2Client = new google.auth.OAuth2(
+        this.configService.get<string>('GOOGLE_CLIENT_ID'),
+        this.configService.get<string>('GOOGLE_CLIENT_SECRET'),
+        `${this.configService.get<string>('GOOGLE_REDIRECT_URI')}`,
+      );
+
+      const { tokens } = await oauth2Client.getToken(code);
+
+      if (!tokens.access_token) {
+        return res.redirect(`${frontendUrl}/dashboard?gmail_error=no_token`);
+      }
+
+      // Get user email from Google
+      oauth2Client.setCredentials(tokens);
+      const oauth2 = google.oauth2({ version: 'v2', auth: oauth2Client });
+      const userInfo = await oauth2.userinfo.get();
+
+      // Save tokens to database
+      await this.gmailService.saveGmailTokens(
+        userId,
+        tokens.access_token,
+        tokens.refresh_token,
+        tokens.expiry_date,
+        userInfo.data.email,
+      );
+
+      // Redirect to dashboard with success
+      res.redirect(`${frontendUrl}/dashboard?gmail_connected=true`);
+    } catch (error) {
+      console.error('Gmail OAuth callback error:', error);
+      res.redirect(`${frontendUrl}/dashboard?gmail_error=callback_failed`);
     }
-  
-    // Extract userId from state (format: userId_timestamp_random)
-    const userId = state ? parseInt(state.split('_')[0], 10) : null;
-  
-    // Exchange code for tokens and store if userId provided
-    const tokens = await this.gmailService.exchangeCodeForTokens(code, userId || undefined);
-  
-    return {
-      message: "OAuth success",
-      tokens,
-      state,
-    };
   }
 
   /**
-   * Exchange authorization code for tokens (API endpoint)
+   * Check Gmail connection status
    */
-  @Post('oauth/token')
+  @Get('connection/status')
   @UseGuards(JwtAuthGuard)
   @ApiBearerAuth('JWT-auth')
   @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: 'Exchange authorization code for access and refresh tokens' })
+  @ApiOperation({ summary: 'Check if Gmail is connected for current user' })
   @ApiResponse({
     status: 200,
-    description: 'Tokens retrieved successfully',
-    type: TBaseDTO<{ accessToken: string; refreshToken?: string; expiresIn?: number }>,
+    description: 'Gmail connection status',
+    type: TBaseDTO<{ connected: boolean; email?: string }>,
   })
-  @ApiResponse({ status: 400, description: 'Invalid authorization code' })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
-  async exchangeToken(
+  async getGmailConnectionStatus(
     @Request() req: any,
-    @Body() callbackDto: OAuthCallbackDto,
-  ): Promise<TBaseDTO<{ accessToken: string; refreshToken?: string; expiresIn?: number }>> {
-    try {
-      const userId = req.user.userId;
-      const tokens = await this.gmailService.exchangeCodeForTokens(callbackDto.code, userId);
-      return new TBaseDTO<{ accessToken: string; refreshToken?: string; expiresIn?: number }>(
-        tokens,
-      );
-    } catch (error: any) {
-      return new TBaseDTO<{ accessToken: string; refreshToken?: string; expiresIn?: number }>(
+  ): Promise<TBaseDTO<{ connected: boolean; email?: string }>> {
+    const userId = req.user.userId;
+    const status = await this.gmailService.checkGmailConnection(userId);
+    return new TBaseDTO<{ connected: boolean; email?: string }>(status);
+  }
+
+  /**
+   * Disconnect Gmail
+   */
+  @Post('disconnect')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Disconnect Gmail account' })
+  @ApiResponse({
+    status: 200,
+    description: 'Gmail disconnected successfully',
+    type: TBaseDTO<{ success: boolean }>,
+  })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  async disconnectGmail(
+    @Request() req: any,
+  ): Promise<TBaseDTO<{ success: boolean }>> {
+    const userId = req.user.userId;
+    await this.gmailService.deleteGmailTokens(userId);
+    return new TBaseDTO<{ success: boolean }>({ success: true });
+  }
+
+  /**
+   * Check Gmail connection status (legacy endpoint)
+   * @deprecated Use /gmail/connection/status instead
+   */
+  @Get('status')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Check if Gmail is connected for current user' })
+  @ApiResponse({
+    status: 200,
+    description: 'Gmail connection status',
+    type: TBaseDTO<{ connected: boolean; email?: string }>,
+  })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  async getGmailStatus(
+    @Request() req: any,
+  ): Promise<TBaseDTO<{ connected: boolean; email?: string }>> {
+    const userId = req.user.userId;
+    const status = await this.gmailService.checkGmailConnection(userId);
+    return new TBaseDTO<{ connected: boolean; email?: string }>(status);
+  }
+
+  /**
+   * Sync emails from Gmail - fetch and store in database
+   */
+  @Post('sync')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Sync emails from Gmail to database' })
+  @ApiResponse({
+    status: 200,
+    description: 'Emails synced successfully',
+    type: TBaseDTO<{ synced: number; message: string }>,
+  })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 400, description: 'Bad request' })
+  async syncEmails(
+    @Request() req: any,
+  ): Promise<TBaseDTO<{ synced: number; message: string }>> {
+    const userId = req.user.userId;
+    const result = await this.gmailService.fetchAndStoreEmails(userId, 50);
+
+    if (result.success) {
+      return new TBaseDTO<{ synced: number; message: string }>({
+        synced: result.count,
+        message: result.message,
+      });
+    } else {
+      return new TBaseDTO<{ synced: number; message: string }>(
         undefined,
         undefined,
-        error.message || 'Failed to exchange code for tokens',
+        result.message,
       );
     }
   }
@@ -154,8 +285,6 @@ export class GmailController {
     const userId = req.user.userId;
     const result = await this.gmailService.fetchAndStoreEmails(
       userId,
-      fetchEmailsDto.accessToken,
-      fetchEmailsDto.refreshToken,
       fetchEmailsDto.maxResults || 50,
     );
 
@@ -181,33 +310,60 @@ export class GmailController {
   @ApiBearerAuth('JWT-auth')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Get stored emails from database' })
-  @ApiQuery({ name: 'page', required: false, type: Number, description: 'Page number (default: 1)' })
-  @ApiQuery({ name: 'limit', required: false, type: Number, description: 'Items per page (default: 20, max: 100)' })
+  @ApiQuery({
+    name: 'page',
+    required: false,
+    type: Number,
+    description: 'Page number (default: 1)',
+  })
+  @ApiQuery({
+    name: 'limit',
+    required: false,
+    type: Number,
+    description: 'Items per page (default: 20, max: 100)',
+  })
   @ApiResponse({
     status: 200,
     description: 'Stored emails retrieved successfully',
-    type: TBaseDTO<{ emails: any[]; total: number; page: number; limit: number }>,
+    type: TBaseDTO<{
+      emails: any[];
+      total: number;
+      page: number;
+      limit: number;
+    }>,
   })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
   async getStoredEmails(
     @Request() req: any,
     @Query('page') page?: string,
     @Query('limit') limit?: string,
-  ): Promise<TBaseDTO<{ emails: any[]; total: number; page: number; limit: number }>> {
+  ): Promise<
+    TBaseDTO<{ emails: any[]; total: number; page: number; limit: number }>
+  > {
     const userId = req.user.userId;
     const pageNum = page ? parseInt(page, 10) : 1;
     const limitNum = limit ? Math.min(parseInt(limit, 10), 100) : 20;
 
     if (pageNum < 1 || limitNum < 1) {
-      return new TBaseDTO<{ emails: any[]; total: number; page: number; limit: number }>(
-        undefined,
-        undefined,
-        'Page and limit must be positive numbers',
-      );
+      return new TBaseDTO<{
+        emails: any[];
+        total: number;
+        page: number;
+        limit: number;
+      }>(undefined, undefined, 'Page and limit must be positive numbers');
     }
 
-    const result = await this.gmailService.getStoredEmails(userId, pageNum, limitNum);
-    return new TBaseDTO<{ emails: any[]; total: number; page: number; limit: number }>(result);
+    const result = await this.gmailService.getStoredEmails(
+      userId,
+      pageNum,
+      limitNum,
+    );
+    return new TBaseDTO<{
+      emails: any[];
+      total: number;
+      page: number;
+      limit: number;
+    }>(result);
   }
 
   /**
@@ -221,15 +377,36 @@ export class GmailController {
   @ApiResponse({
     status: 200,
     description: 'Mailboxes retrieved successfully',
-    type: TBaseDTO<{ mailboxes: Array<{ id: string; name: string; count: number; unreadCount: number }> }>,
+    type: TBaseDTO<{
+      mailboxes: Array<{
+        id: string;
+        name: string;
+        count: number;
+        unreadCount: number;
+      }>;
+    }>,
   })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
-  async getMailboxes(
-    @Request() req: any,
-  ): Promise<TBaseDTO<{ mailboxes: Array<{ id: string; name: string; count: number; unreadCount: number }> }>> {
+  async getMailboxes(@Request() req: any): Promise<
+    TBaseDTO<{
+      mailboxes: Array<{
+        id: string;
+        name: string;
+        count: number;
+        unreadCount: number;
+      }>;
+    }>
+  > {
     const userId = req.user.userId;
     const result = await this.gmailService.getMailboxes(userId);
-    return new TBaseDTO<{ mailboxes: Array<{ id: string; name: string; count: number; unreadCount: number }> }>(result);
+    return new TBaseDTO<{
+      mailboxes: Array<{
+        id: string;
+        name: string;
+        count: number;
+        unreadCount: number;
+      }>;
+    }>(result);
   }
 
   /**
@@ -240,15 +417,45 @@ export class GmailController {
   @ApiBearerAuth('JWT-auth')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Get emails in a mailbox' })
-  @ApiParam({ name: 'id', description: 'Mailbox ID (e.g., INBOX, SENT, DRAFT)', example: 'INBOX' })
-  @ApiQuery({ name: 'page', required: false, type: Number, description: 'Page number (default: 1)' })
-  @ApiQuery({ name: 'limit', required: false, type: Number, description: 'Items per page (default: 20, max: 100)' })
-  @ApiQuery({ name: 'isRead', required: false, type: Boolean, description: 'Filter by read status' })
-  @ApiQuery({ name: 'isStarred', required: false, type: Boolean, description: 'Filter by starred status' })
+  @ApiParam({
+    name: 'id',
+    description: 'Mailbox ID (e.g., INBOX, SENT, DRAFT)',
+    example: 'INBOX',
+  })
+  @ApiQuery({
+    name: 'page',
+    required: false,
+    type: Number,
+    description: 'Page number (default: 1)',
+  })
+  @ApiQuery({
+    name: 'limit',
+    required: false,
+    type: Number,
+    description: 'Items per page (default: 20, max: 100)',
+  })
+  @ApiQuery({
+    name: 'isRead',
+    required: false,
+    type: Boolean,
+    description: 'Filter by read status',
+  })
+  @ApiQuery({
+    name: 'isStarred',
+    required: false,
+    type: Boolean,
+    description: 'Filter by starred status',
+  })
   @ApiResponse({
     status: 200,
     description: 'Emails retrieved successfully',
-    type: TBaseDTO<{ emails: any[]; total: number; page: number; limit: number; mailbox: string }>,
+    type: TBaseDTO<{
+      emails: any[];
+      total: number;
+      page: number;
+      limit: number;
+      mailbox: string;
+    }>,
   })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
   @ApiResponse({ status: 404, description: 'Mailbox not found' })
@@ -259,17 +466,27 @@ export class GmailController {
     @Query('limit') limit?: string,
     @Query('isRead') isRead?: string,
     @Query('isStarred') isStarred?: string,
-  ): Promise<TBaseDTO<{ emails: any[]; total: number; page: number; limit: number; mailbox: string }>> {
+  ): Promise<
+    TBaseDTO<{
+      emails: any[];
+      total: number;
+      page: number;
+      limit: number;
+      mailbox: string;
+    }>
+  > {
     const userId = req.user.userId;
     const pageNum = page ? parseInt(page, 10) : 1;
     const limitNum = limit ? Math.min(parseInt(limit, 10), 100) : 20;
 
     if (pageNum < 1 || limitNum < 1) {
-      return new TBaseDTO<{ emails: any[]; total: number; page: number; limit: number; mailbox: string }>(
-        undefined,
-        undefined,
-        'Page and limit must be positive numbers',
-      );
+      return new TBaseDTO<{
+        emails: any[];
+        total: number;
+        page: number;
+        limit: number;
+        mailbox: string;
+      }>(undefined, undefined, 'Page and limit must be positive numbers');
     }
 
     const filters: { isRead?: boolean; isStarred?: boolean } = {};
@@ -288,7 +505,13 @@ export class GmailController {
       filters,
     );
 
-    return new TBaseDTO<{ emails: any[]; total: number; page: number; limit: number; mailbox: string }>(result);
+    return new TBaseDTO<{
+      emails: any[];
+      total: number;
+      page: number;
+      limit: number;
+      mailbox: string;
+    }>(result);
   }
 
   /**
@@ -315,11 +538,7 @@ export class GmailController {
     const email = await this.gmailService.getEmailDetail(userId, emailId);
 
     if (!email) {
-      return new TBaseDTO<any>(
-        undefined,
-        undefined,
-        'Email not found',
-      );
+      return new TBaseDTO<any>(undefined, undefined, 'Email not found');
     }
 
     return new TBaseDTO<any>(email);
@@ -489,8 +708,17 @@ export class GmailController {
   @ApiBearerAuth('JWT-auth')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Get email attachment' })
-  @ApiParam({ name: 'emailId', description: 'Email ID', type: Number, example: 1 })
-  @ApiParam({ name: 'attachmentId', description: 'Attachment ID from Gmail', type: String })
+  @ApiParam({
+    name: 'emailId',
+    description: 'Email ID',
+    type: Number,
+    example: 1,
+  })
+  @ApiParam({
+    name: 'attachmentId',
+    description: 'Attachment ID from Gmail',
+    type: String,
+  })
   @ApiResponse({
     status: 200,
     description: 'Attachment retrieved successfully',
@@ -511,7 +739,10 @@ export class GmailController {
     );
 
     if (result.success && result.data) {
-      res.setHeader('Content-Type', result.contentType || 'application/octet-stream');
+      res.setHeader(
+        'Content-Type',
+        result.contentType || 'application/octet-stream',
+      );
       res.setHeader(
         'Content-Disposition',
         `attachment; filename="${result.filename || 'attachment'}"`,
@@ -705,4 +936,3 @@ export class GmailController {
     }>(result);
   }
 }
-

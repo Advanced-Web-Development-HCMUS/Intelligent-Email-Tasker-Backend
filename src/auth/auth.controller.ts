@@ -1,26 +1,32 @@
 import {
   Controller,
   Post,
+  Get,
   Body,
   HttpCode,
   HttpStatus,
   UseGuards,
   Request,
+  Response,
+  Req,
+  Res,
 } from '@nestjs/common';
 import {
   ApiTags,
   ApiOperation,
   ApiResponse,
   ApiBearerAuth,
+  ApiExcludeEndpoint,
 } from '@nestjs/swagger';
+import { Response as ExpressResponse } from 'express';
 import { AuthService } from './auth.service';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
-import { GoogleLoginDto } from './dto/google-login.dto';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
 import { AuthResponseDto } from './dto/auth-response.dto';
 import { TBaseDTO } from '../common/dto/base.dto';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
+import { GoogleOAuthGuard } from './guards/google-oauth.guard';
 
 /**
  * Controller for authentication endpoints
@@ -41,11 +47,23 @@ export class AuthController {
     description: 'Registration successful',
     type: TBaseDTO<AuthResponseDto>,
   })
-  @ApiResponse({ status: 400, description: 'Email already registered or validation error' })
+  @ApiResponse({
+    status: 400,
+    description: 'Email already registered or validation error',
+  })
   async register(
     @Body() registerDto: RegisterDto,
+    @Response({ passthrough: true }) res: any,
   ): Promise<TBaseDTO<AuthResponseDto>> {
-    return this.authService.register(registerDto);
+    const result = await this.authService.register(registerDto);
+
+    if (result.data?.refreshToken) {
+      this.setRefreshTokenCookie(res, result.data.refreshToken);
+      // Remove refreshToken from response body
+      delete result.data.refreshToken;
+    }
+
+    return result;
   }
 
   /**
@@ -62,26 +80,101 @@ export class AuthController {
   @ApiResponse({ status: 401, description: 'Invalid credentials' })
   async login(
     @Body() loginDto: LoginDto,
+    @Response({ passthrough: true }) res: any,
   ): Promise<TBaseDTO<AuthResponseDto>> {
-    return this.authService.login(loginDto);
+    const result = await this.authService.login(loginDto);
+
+    if (result.data?.refreshToken) {
+      this.setRefreshTokenCookie(res, result.data.refreshToken);
+      // Remove refreshToken from response body
+      delete result.data.refreshToken;
+    }
+
+    return result;
   }
 
   /**
-   * Login with Google OAuth
+   * Initiate Google OAuth login - BACKEND-DRIVEN FLOW
+   *
+   * Step 1: User visits this endpoint
+   * Step 2: Backend redirects to Google's consent screen
+   * Step 3: User authorizes on Google
+   * Step 4: Google redirects to /auth/google/callback
+   *
+   * @UseGuards(GoogleOAuthGuard) triggers Passport to redirect to Google
    */
-  @Post('google')
-  @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: 'Login with Google OAuth' })
-  @ApiResponse({
-    status: 200,
-    description: 'Google login successful',
-    type: TBaseDTO<AuthResponseDto>,
+  @Get('google')
+  @UseGuards(GoogleOAuthGuard)
+  @ApiOperation({
+    summary: 'Initiate Google OAuth2 login (Backend-Driven)',
+    description:
+      'Redirects user to Google OAuth2 consent screen. ' +
+      'This is the entry point for backend-driven OAuth flow.',
   })
-  @ApiResponse({ status: 401, description: 'Invalid Google token' })
-  async googleLogin(
-    @Body() googleLoginDto: GoogleLoginDto,
-  ): Promise<TBaseDTO<AuthResponseDto>> {
-    return this.authService.googleLogin(googleLoginDto);
+  @ApiResponse({
+    status: 302,
+    description: 'Redirects to Google OAuth consent screen',
+  })
+  async googleAuth(): Promise<void> {
+    // Guard automatically handles redirect to Google
+    // No code needed here
+  }
+
+  /**
+   * Google OAuth callback - BACKEND-DRIVEN FLOW
+   *
+   * Step 5: Google redirects here with authorization code
+   * Step 6: Passport exchanges code for access/refresh tokens (automatic)
+   * Step 7: GoogleStrategy validates and saves user + Gmail tokens
+   * Step 8: Backend generates JWT tokens
+   * Step 9: Redirect to frontend with JWT access token
+   *
+   * The frontend should:
+   * 1. Extract token from URL query param
+   * 2. Store in localStorage/sessionStorage
+   * 3. Use for subsequent API calls
+   * 4. Refresh token is stored as httpOnly cookie for security
+   */
+  @Get('oauth/callback')
+  @UseGuards(GoogleOAuthGuard)
+  @ApiExcludeEndpoint() // Hide from Swagger - this is a redirect endpoint
+  async googleAuthCallback(
+    @Req() req: any,
+    @Res() res: ExpressResponse,
+  ): Promise<void> {
+    try {
+      // User is attached to req.user by GoogleStrategy after successful OAuth
+      const user = req.user;
+
+      if (!user) {
+        const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+        return res.redirect(`${frontendUrl}/login?error=authentication_failed`);
+      }
+
+      // Generate JWT tokens for our app
+      const authResponse = await this.authService.generateAuthResponse(user);
+
+      if (!authResponse.data) {
+        const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+        return res.redirect(
+          `${frontendUrl}/login?error=token_generation_failed`,
+        );
+      }
+
+      // Set refresh token as httpOnly cookie (secure, can't be accessed by JavaScript)
+      this.setRefreshTokenCookie(res, authResponse.data.refreshToken);
+
+      // Redirect to frontend with access token in URL
+      // Frontend should extract and store in localStorage, then clear from URL
+      const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+      const redirectUrl = `${frontendUrl}/auth/callback?token=${authResponse.data.accessToken}`;
+
+      res.redirect(redirectUrl);
+    } catch (error: any) {
+      console.error('Google OAuth callback error:', error);
+      const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+      res.redirect(`${frontendUrl}/login?error=callback_failed`);
+    }
   }
 
   /**
@@ -97,9 +190,19 @@ export class AuthController {
   })
   @ApiResponse({ status: 401, description: 'Invalid refresh token' })
   async refreshToken(
-    @Body() refreshTokenDto: RefreshTokenDto,
+    @Request() req: any,
   ): Promise<TBaseDTO<{ accessToken: string }>> {
-    return this.authService.refreshToken(refreshTokenDto);
+    const refreshToken = req.cookies?.refreshToken;
+
+    if (!refreshToken) {
+      return new TBaseDTO<{ accessToken: string }>(
+        undefined,
+        undefined,
+        'Refresh token not found',
+      );
+    }
+
+    return this.authService.refreshToken({ refreshToken });
   }
 
   /**
@@ -116,10 +219,22 @@ export class AuthController {
     type: TBaseDTO<{ message: string }>,
   })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
-  async logout(@Request() req: any): Promise<TBaseDTO<{ message: string }>> {
-    // In a real implementation, you would revoke the refresh token here
-    // For this mock, we'll just return success
-    return new TBaseDTO<{ message: string }>({ message: 'Logged out successfully' });
+  async logout(
+    @Request() req: any,
+    @Response({ passthrough: true }) res: any,
+  ): Promise<TBaseDTO<{ message: string }>> {
+    const refreshToken = req.cookies?.refreshToken;
+
+    if (refreshToken) {
+      await this.authService.revokeRefreshToken(refreshToken);
+    }
+
+    // Clear refresh token cookie
+    this.clearRefreshTokenCookie(res);
+
+    return new TBaseDTO<{ message: string }>({
+      message: 'Logged out successfully',
+    });
   }
 
   /**
@@ -145,5 +260,29 @@ export class AuthController {
       name: req.user.name,
     });
   }
-}
 
+  /**
+   * Set refresh token as httpOnly cookie
+   */
+  private setRefreshTokenCookie(res: any, refreshToken: string): void {
+    res.cookie('refreshToken', refreshToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production', // true in production (HTTPS)
+      sameSite: 'lax',
+      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+      path: '/',
+    });
+  }
+
+  /**
+   * Clear refresh token cookie
+   */
+  private clearRefreshTokenCookie(res: any): void {
+    res.clearCookie('refreshToken', {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      path: '/',
+    });
+  }
+}

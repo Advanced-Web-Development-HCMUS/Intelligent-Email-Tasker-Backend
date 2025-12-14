@@ -35,7 +35,8 @@ export class GmailService {
     const oauth2Client = new google.auth.OAuth2(
       process.env.GOOGLE_CLIENT_ID,
       process.env.GOOGLE_CLIENT_SECRET,
-      process.env.GOOGLE_REDIRECT_URI || 'http://localhost:3001/gmail/oauth/callback',
+      process.env.GOOGLE_REDIRECT_URI ||
+        'http://localhost:3000/auth/google/callback',
     );
 
     if (accessToken) {
@@ -49,61 +50,65 @@ export class GmailService {
   }
 
   /**
-   * Generate OAuth authorization URL
+   * Check if user has Gmail connected
    */
-  generateAuthUrl(userId: number): { url: string; state: string } {
-    const oauth2Client = this.createOAuth2Client();
-    const state = `${userId}_${Date.now()}_${Math.random().toString(36).substring(7)}`;
-
-    const scopes = [
-      'https://www.googleapis.com/auth/gmail.readonly',
-      'https://www.googleapis.com/auth/gmail.modify', // For mark read/unread, delete, labels
-      'https://www.googleapis.com/auth/gmail.send', // For send/reply
-      'https://www.googleapis.com/auth/userinfo.email',
-      'https://www.googleapis.com/auth/userinfo.profile',
-    ];
-
-    const url = oauth2Client.generateAuthUrl({
-      access_type: 'offline',
-      scope: scopes,
-      state: state,
-      prompt: 'consent', // Force consent screen to get refresh token
+  async checkGmailConnection(
+    userId: number,
+  ): Promise<{ connected: boolean; email?: string }> {
+    const token = await this.gmailTokenRepository.findOne({
+      where: { userId },
+      relations: ['user'],
     });
 
-    return { url, state };
+    if (!token) {
+      return { connected: false };
+    }
+
+    return {
+      connected: true,
+      email: token.user?.email,
+    };
   }
 
   /**
-   * Exchange authorization code for tokens and store securely
+   * Save Gmail OAuth tokens (for OAuth callback)
    */
-  async exchangeCodeForTokens(
-    code: string,
-    userId?: number,
-  ): Promise<{ accessToken: string; refreshToken?: string; expiresIn?: number }> {
-    const oauth2Client = this.createOAuth2Client();
+  async saveGmailTokens(
+    userId: number,
+    accessToken: string,
+    refreshToken: string | null | undefined,
+    expiryDate: number | null | undefined,
+    email?: string | null,
+  ): Promise<void> {
+    let token = await this.gmailTokenRepository.findOne({
+      where: { userId },
+    });
 
-    try {
-      const { tokens } = await oauth2Client.getToken(code);
+    const accessTokenExpiry = expiryDate ? new Date(expiryDate) : null;
 
-      const accessToken = tokens.access_token || '';
-      const refreshToken = tokens.refresh_token;
-      const expiresIn = tokens.expiry_date
-        ? Math.floor((tokens.expiry_date - Date.now()) / 1000)
-        : undefined;
-
-      // Store refresh token securely if userId provided
-      if (userId && refreshToken) {
-        await this.saveGmailToken(userId, refreshToken, accessToken, expiresIn);
+    if (token) {
+      token.accessToken = accessToken;
+      if (refreshToken) {
+        token.refreshToken = refreshToken;
       }
-
-      return {
+      token.accessTokenExpiry = accessTokenExpiry;
+    } else {
+      token = this.gmailTokenRepository.create({
+        userId,
         accessToken,
-        refreshToken,
-        expiresIn,
-      };
-    } catch (error: any) {
-      throw new Error(`Failed to exchange code for tokens: ${error.message}`);
+        refreshToken: refreshToken || '',
+        accessTokenExpiry,
+      });
     }
+
+    await this.gmailTokenRepository.save(token);
+  }
+
+  /**
+   * Delete Gmail tokens (disconnect)
+   */
+  async deleteGmailTokens(userId: number): Promise<void> {
+    await this.gmailTokenRepository.delete({ userId });
   }
 
   /**
@@ -119,9 +124,8 @@ export class GmailService {
       where: { userId },
     });
 
-    const accessTokenExpiry = accessToken && expiresIn
-      ? new Date(Date.now() + expiresIn * 1000)
-      : null;
+    const accessTokenExpiry =
+      accessToken && expiresIn ? new Date(Date.now() + expiresIn * 1000) : null;
 
     if (token) {
       token.refreshToken = refreshToken;
@@ -150,7 +154,9 @@ export class GmailService {
     });
 
     if (!token) {
-      throw new Error('Gmail token not found. Please re-authenticate with Google.');
+      throw new Error(
+        'Gmail token not found. Please re-authenticate with Google.',
+      );
     }
 
     // Check if access token is still valid (with 5 minute buffer)
@@ -199,7 +205,12 @@ export class GmailService {
         : undefined;
 
       // Update stored token
-      await this.saveGmailToken(userId, refreshToken, newAccessToken, expiresIn);
+      await this.saveGmailToken(
+        userId,
+        refreshToken,
+        newAccessToken,
+        expiresIn,
+      );
 
       return newAccessToken;
     } catch (error: any) {
@@ -222,12 +233,9 @@ export class GmailService {
 
   /**
    * Fetch emails from Gmail and store in database
-   * If accessToken is provided, use it; otherwise use stored token with auto-refresh
    */
   async fetchAndStoreEmails(
     userId: number,
-    accessToken?: string,
-    refreshToken?: string,
     maxResults: number = 50,
   ): Promise<{ success: boolean; count: number; message: string }> {
     try {
@@ -237,15 +245,8 @@ export class GmailService {
         return { success: false, count: 0, message: 'User not found' };
       }
 
-      let gmail;
-      if (accessToken) {
-        // Use provided access token (legacy support)
-        const oauth2Client = this.createOAuth2Client(accessToken, refreshToken);
-        gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-      } else {
-        // Use stored token with auto-refresh
-        gmail = await this.getGmailClient(userId);
-      }
+      // Use stored token with auto-refresh
+      const gmail = await this.getGmailClient(userId);
 
       // Fetch messages
       let response;
@@ -303,7 +304,10 @@ export class GmailService {
               format: 'full',
             });
           } catch (error: any) {
-            console.error(`Error fetching message ${message.id}:`, error.message);
+            console.error(
+              `Error fetching message ${message.id}:`,
+              error.message,
+            );
             // Skip this message and continue
             continue;
           }
@@ -319,15 +323,21 @@ export class GmailService {
           // Extract headers
           const headers = payload.headers || [];
           const getHeader = (name: string): string => {
-            const header = headers.find((h) => h.name?.toLowerCase() === name.toLowerCase());
+            const header = headers.find(
+              (h) => h.name?.toLowerCase() === name.toLowerCase(),
+            );
             return header?.value || '';
           };
 
           // Extract email addresses
           const from = getHeader('From');
           const fromMatch = from.match(/(.*?)\s*<(.+?)>|(.+)/);
-          const fromName = fromMatch ? (fromMatch[1] || fromMatch[3] || '').trim() : '';
-          const fromEmail = fromMatch ? (fromMatch[2] || fromMatch[3] || '').trim() : from;
+          const fromName = fromMatch
+            ? (fromMatch[1] || fromMatch[3] || '').trim()
+            : '';
+          const fromEmail = fromMatch
+            ? (fromMatch[2] || fromMatch[3] || '').trim()
+            : from;
 
           const to = getHeader('To') || '';
           const cc = getHeader('Cc') || '';
@@ -339,7 +349,9 @@ export class GmailService {
 
           const extractBody = (part: any): void => {
             if (part.body?.data) {
-              const data = Buffer.from(part.body.data, 'base64').toString('utf-8');
+              const data = Buffer.from(part.body.data, 'base64').toString(
+                'utf-8',
+              );
               const mimeType = part.mimeType || '';
 
               if (mimeType === 'text/plain') {
@@ -398,9 +410,15 @@ export class GmailService {
               threadId: msg.threadId || null,
               from: fromEmail || '',
               fromName: fromName || fromEmail || '',
-              to: to ? JSON.stringify(to.split(',').map((e: string) => e.trim())) : null,
-              cc: cc ? JSON.stringify(cc.split(',').map((e: string) => e.trim())) : null,
-              bcc: bcc ? JSON.stringify(bcc.split(',').map((e: string) => e.trim())) : null,
+              to: to
+                ? JSON.stringify(to.split(',').map((e: string) => e.trim()))
+                : null,
+              cc: cc
+                ? JSON.stringify(cc.split(',').map((e: string) => e.trim()))
+                : null,
+              bcc: bcc
+                ? JSON.stringify(bcc.split(',').map((e: string) => e.trim()))
+                : null,
               subject: getHeader('Subject') || '',
               snippet: msg.snippet || '',
               bodyText: bodyText || '',
@@ -420,11 +438,17 @@ export class GmailService {
             storedCount++;
             storedEmailIds.push(savedEmail.id);
           } catch (dbError: any) {
-            console.error(`Error saving email ${message.id} to database:`, dbError.message);
+            console.error(
+              `Error saving email ${message.id} to database:`,
+              dbError.message,
+            );
             // Continue with next message
           }
         } catch (error: any) {
-          console.error(`Error processing message ${message.id}:`, error.message);
+          console.error(
+            `Error processing message ${message.id}:`,
+            error.message,
+          );
           // Continue with next message
         }
       }
@@ -432,7 +456,10 @@ export class GmailService {
       // Publish event to Kafka for AI processing
       if (storedCount > 0 && storedEmailIds.length > 0) {
         try {
-          await this.kafkaService.publishEmailFetchedEvent(userId, storedEmailIds);
+          await this.kafkaService.publishEmailFetchedEvent(
+            userId,
+            storedEmailIds,
+          );
         } catch (kafkaError: any) {
           console.error('Failed to publish Kafka event:', kafkaError);
           // Don't fail the whole operation if Kafka fails
@@ -459,14 +486,16 @@ export class GmailService {
         return {
           success: false,
           count: 0,
-          message: 'Invalid or expired access token. Please re-authenticate with Google.',
+          message:
+            'Invalid or expired access token. Please re-authenticate with Google.',
         };
       }
       if (error.code === 403 || error.response?.status === 403) {
         return {
           success: false,
           count: 0,
-          message: 'Gmail API access denied. Please grant Gmail.readonly permission.',
+          message:
+            'Gmail API access denied. Please grant Gmail.readonly permission.',
         };
       }
       if (error.code === 'ENOTFOUND' || error.code === 'ECONNREFUSED') {
@@ -488,9 +517,14 @@ export class GmailService {
   /**
    * Get list of mailboxes (Inbox, Sent, etc.) based on labels
    */
-  async getMailboxes(
-    userId: number,
-  ): Promise<{ mailboxes: Array<{ id: string; name: string; count: number; unreadCount: number }> }> {
+  async getMailboxes(userId: number): Promise<{
+    mailboxes: Array<{
+      id: string;
+      name: string;
+      count: number;
+      unreadCount: number;
+    }>;
+  }> {
     const MAX_MAILBOXES = 50;
     const commonMailboxes = [
       { id: 'INBOX', name: 'Inbox' },
@@ -502,7 +536,12 @@ export class GmailService {
       { id: 'STARRED', name: 'Starred' },
     ];
 
-    const mailboxes: Array<{ id: string; name: string; count: number; unreadCount: number }> = [];
+    const mailboxes: Array<{
+      id: string;
+      name: string;
+      count: number;
+      unreadCount: number;
+    }> = [];
 
     // Get counts for common mailboxes
     for (const mailbox of commonMailboxes) {
@@ -641,19 +680,29 @@ export class GmailService {
 
     // Filter by mailbox (label)
     if (mailboxId === 'STARRED') {
-      queryBuilder.andWhere('email.isStarred = :isStarred', { isStarred: true });
+      queryBuilder.andWhere('email.isStarred = :isStarred', {
+        isStarred: true,
+      });
     } else if (mailboxId === 'IMPORTANT') {
-      queryBuilder.andWhere('email.isImportant = :isImportant', { isImportant: true });
+      queryBuilder.andWhere('email.isImportant = :isImportant', {
+        isImportant: true,
+      });
     } else {
-      queryBuilder.andWhere('email.labels LIKE :label', { label: `%${mailboxId}%` });
+      queryBuilder.andWhere('email.labels LIKE :label', {
+        label: `%${mailboxId}%`,
+      });
     }
 
     // Apply additional filters
     if (filters.isRead !== undefined) {
-      queryBuilder.andWhere('email.isRead = :isRead', { isRead: filters.isRead });
+      queryBuilder.andWhere('email.isRead = :isRead', {
+        isRead: filters.isRead,
+      });
     }
     if (filters.isStarred !== undefined) {
-      queryBuilder.andWhere('email.isStarred = :isStarred', { isStarred: filters.isStarred });
+      queryBuilder.andWhere('email.isStarred = :isStarred', {
+        isStarred: filters.isStarred,
+      });
     }
 
     // Get total count
@@ -697,7 +746,9 @@ export class GmailService {
           summary: summary
             ? {
                 summary: summary.summary,
-                keyPoints: summary.keyPoints ? JSON.parse(summary.keyPoints) : [],
+                keyPoints: summary.keyPoints
+                  ? JSON.parse(summary.keyPoints)
+                  : [],
                 sentiment: summary.sentiment,
                 category: summary.category,
                 priority: summary.priority,
@@ -724,16 +775,59 @@ export class GmailService {
       where: { emailRawId: email.id },
     });
 
-    const baseEmail = {
+    if (!email) {
+      return null;
+    }
+
+    // Helper function to parse email addresses
+    const parseEmailAddresses = (
+      emailString: string | null,
+    ): Array<{ name: string; email: string }> => {
+      if (!emailString) return [];
+
+      try {
+        const parsed = JSON.parse(emailString);
+        if (Array.isArray(parsed)) {
+          return parsed.map((addr: string) => {
+            const match = addr.match(/(.*?)\s*<(.+?)>|(.+)/);
+            if (match) {
+              const name = (match[1] || match[3] || '').trim();
+              const email = (match[2] || match[3] || '').trim();
+              return { name: name || email, email };
+            }
+            return { name: addr.trim(), email: addr.trim() };
+          });
+        }
+      } catch (e) {
+        // If parsing fails, treat as single email
+      }
+
+      // Single email string
+      const match = emailString.match(/(.*?)\s*<(.+?)>|(.+)/);
+      if (match) {
+        const name = (match[1] || match[3] || '').trim();
+        const email = (match[2] || match[3] || '').trim();
+        return [{ name: name || email, email }];
+      }
+
+      return [{ name: emailString, email: emailString }];
+    };
+
+    // Parse JSON fields and format for frontend
+    return {
       id: email.id,
       gmailId: email.gmailId,
       threadId: email.threadId,
-      from: email.from,
-      fromName: email.fromName,
-      to: email.to ? JSON.parse(email.to) : [],
-      cc: email.cc ? JSON.parse(email.cc) : [],
-      bcc: email.bcc ? JSON.parse(email.bcc) : [],
-      subject: email.subject,
+      from: {
+        name: email.fromName || email.from || 'Unknown',
+        email: email.from || '',
+      },
+      to: parseEmailAddresses(email.to),
+      cc: parseEmailAddresses(email.cc),
+      bcc: parseEmailAddresses(email.bcc),
+      subject: email.subject || '(No Subject)',
+      body: email.bodyHtml || email.bodyText || '',
+      isHtml: !!email.bodyHtml,
       snippet: email.snippet,
       bodyText: email.bodyText,
       bodyHtml: email.bodyHtml,
@@ -743,7 +837,7 @@ export class GmailService {
       labels: email.labels ? JSON.parse(email.labels) : [],
       receivedAt: email.receivedAt,
       sentAt: email.sentAt,
-      rawData: email.rawData ? JSON.parse(email.rawData) : null,
+      attachments: [], // TODO: Extract attachments from rawData if needed
       createdAt: email.createdAt,
       updatedAt: email.updatedAt,
       status: email.status || 'inbox',
@@ -758,8 +852,6 @@ export class GmailService {
           }
         : null,
     };
-
-    return baseEmail;
   }
 
   /**
@@ -818,7 +910,11 @@ export class GmailService {
     body: string,
     cc?: string[],
     bcc?: string[],
-    attachments?: Array<{ filename: string; content: string; contentType: string }>,
+    attachments?: Array<{
+      filename: string;
+      content: string;
+      contentType: string;
+    }>,
   ): Promise<{ success: boolean; messageId?: string; error?: string }> {
     try {
       const gmail = await this.getGmailClient(userId);
@@ -873,7 +969,11 @@ export class GmailService {
     userId: number,
     emailId: number,
     replyBody: string,
-    attachments?: Array<{ filename: string; content: string; contentType: string }>,
+    attachments?: Array<{
+      filename: string;
+      content: string;
+      contentType: string;
+    }>,
   ): Promise<{ success: boolean; messageId?: string; error?: string }> {
     try {
       // Get original email from database
@@ -991,7 +1091,8 @@ export class GmailService {
         id: email.gmailId,
         requestBody: {
           addLabelIds: addLabelIds.length > 0 ? addLabelIds : undefined,
-          removeLabelIds: removeLabelIds.length > 0 ? removeLabelIds : undefined,
+          removeLabelIds:
+            removeLabelIds.length > 0 ? removeLabelIds : undefined,
         },
       });
 
@@ -1054,7 +1155,13 @@ export class GmailService {
     userId: number,
     emailId: number,
     attachmentId: string,
-  ): Promise<{ success: boolean; data?: Buffer; filename?: string; contentType?: string; error?: string }> {
+  ): Promise<{
+    success: boolean;
+    data?: Buffer;
+    filename?: string;
+    contentType?: string;
+    error?: string;
+  }> {
     try {
       const email = await this.emailRawRepository.findOne({
         where: { id: emailId, userId },
@@ -1276,7 +1383,9 @@ export class GmailService {
           summary: summary
             ? {
                 summary: summary.summary,
-                keyPoints: summary.keyPoints ? JSON.parse(summary.keyPoints) : [],
+                keyPoints: summary.keyPoints
+                  ? JSON.parse(summary.keyPoints)
+                  : [],
                 sentiment: summary.sentiment,
                 category: summary.category,
                 priority: summary.priority,
@@ -1349,4 +1458,3 @@ export class GmailService {
     return { restored: result.affected || 0 };
   }
 }
-

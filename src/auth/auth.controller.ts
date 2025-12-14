@@ -135,7 +135,7 @@ export class AuthController {
    * 3. Use for subsequent API calls
    * 4. Refresh token is stored as httpOnly cookie for security
    */
-  @Get('google/callback')
+  @Get('oauth/callback')
   @UseGuards(GoogleOAuthGuard)
   @ApiExcludeEndpoint() // Hide from Swagger - this is a redirect endpoint
   async googleAuthCallback(

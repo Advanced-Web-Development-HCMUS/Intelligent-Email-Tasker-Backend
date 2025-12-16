@@ -131,10 +131,12 @@ export class AIProcessorService {
     await this.emailMetadataRepository.save(emailMetadata);
 
     // 7. Generate embedding and store in Qdrant
+    // Include subject, sender (name + email), and summary for comprehensive search
     try {
-      const embedding = await this.geminiService.generateEmbedding(
-        `${email.subject} ${summaryData.summary}`,
-      );
+      const senderInfo = `${email.fromName || ''} ${email.from || ''}`.trim();
+      const embeddingText = `${email.subject || ''} ${senderInfo} ${summaryData.summary || ''}`.trim();
+      
+      const embedding = await this.geminiService.generateEmbedding(embeddingText);
 
       if (!embedding || embedding.length === 0) {
         throw new Error('Failed to generate embedding');
@@ -145,9 +147,10 @@ export class AIProcessorService {
         embedding,
         {
           emailRawId: emailId,
-          subject: email.subject,
-          summary: summaryData.summary,
+          subject: email.subject || '',
+          summary: summaryData.summary || '',
           from: email.from || '',
+          fromName: email.fromName || '',
           userId: email.userId,
         },
       );
@@ -162,6 +165,24 @@ export class AIProcessorService {
       console.error('Error stack:', error.stack);
       // Continue even if Qdrant fails - email summary and metadata are already saved
     }
+  }
+
+  /**
+   * Get email by ID (helper for search enrichment)
+   */
+  async getEmailById(emailId: number): Promise<EmailRaw | null> {
+    return await this.emailRawRepository.findOne({
+      where: { id: emailId },
+    });
+  }
+
+  /**
+   * Get email summary by email ID (helper for search enrichment)
+   */
+  async getEmailSummary(emailId: number): Promise<EmailSummary | null> {
+    return await this.emailSummaryRepository.findOne({
+      where: { emailRawId: emailId },
+    });
   }
 }
 

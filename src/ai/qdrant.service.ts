@@ -82,6 +82,7 @@ export class QdrantService implements OnModuleInit {
       subject: string;
       summary: string;
       from: string;
+      fromName?: string;
       userId: number;
     },
   ): Promise<number> {
@@ -107,6 +108,7 @@ export class QdrantService implements OnModuleInit {
               subject: payload.subject,
               summary: payload.summary,
               from: payload.from,
+              fromName: payload.fromName || '',
               userId: payload.userId,
               timestamp: new Date().toISOString(),
             },

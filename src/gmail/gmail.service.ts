@@ -1457,4 +1457,5 @@ export class GmailService {
 
     return { restored: result.affected || 0 };
   }
+
 }

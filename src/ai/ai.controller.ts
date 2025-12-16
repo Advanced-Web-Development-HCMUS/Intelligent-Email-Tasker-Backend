@@ -82,15 +82,72 @@ export class AIController {
       const queryEmbedding = await this.geminiService.generateEmbedding(query);
 
       // Search in Qdrant
-      const results = await this.qdrantService.searchSimilarEmails(
+      const qdrantResults = await this.qdrantService.searchSimilarEmails(
         queryEmbedding,
         userId,
-        limit,
+        limit * 2, // Get more results to filter and enrich
       );
 
-      const filteredResults = results.filter(r => r.score > 0.5);
+      // Filter by minimum score and enrich with full email data
+      const filteredResults = await Promise.all(
+        qdrantResults
+          .filter((r) => r.score > 0.5) // Lower threshold for better recall
+          .slice(0, limit)
+          .map(async (result) => {
+            // Get full email data from database
+            const emailId = result.payload.emailRawId;
+            const email = await this.aiProcessorService.getEmailById(emailId);
+            
+            if (!email) {
+              return null;
+            }
 
-      return new TBaseDTO<{ results: any[] }>({ results: filteredResults });
+            // Get summary if available
+            const summary = await this.aiProcessorService.getEmailSummary(emailId);
+
+            return {
+              email: {
+                id: email.id,
+                gmailId: email.gmailId,
+                threadId: email.threadId,
+                from: email.from,
+                fromName: email.fromName,
+                to: email.to ? JSON.parse(email.to) : [],
+                cc: email.cc ? JSON.parse(email.cc) : [],
+                bcc: email.bcc ? JSON.parse(email.bcc) : [],
+                subject: email.subject,
+                snippet: email.snippet,
+                bodyText: email.bodyText,
+                bodyHtml: email.bodyHtml,
+                isRead: email.isRead,
+                isStarred: email.isStarred,
+                isImportant: email.isImportant,
+                labels: email.labels ? JSON.parse(email.labels) : [],
+                receivedAt: email.receivedAt,
+                sentAt: email.sentAt,
+                status: email.status || 'inbox',
+                snoozeUntil: email.snoozeUntil,
+                createdAt: email.createdAt,
+                updatedAt: email.updatedAt,
+                summary: summary
+                  ? {
+                      summary: summary.summary,
+                      keyPoints: summary.keyPoints ? JSON.parse(summary.keyPoints) : [],
+                      sentiment: summary.sentiment,
+                      category: summary.category,
+                      priority: summary.priority,
+                    }
+                  : null,
+              },
+              relevanceScore: Math.round(result.score * 100) / 100,
+            };
+          }),
+      );
+
+      // Filter out null results
+      const validResults = filteredResults.filter((r) => r !== null);
+
+      return new TBaseDTO<{ results: any[] }>({ results: validResults });
     } catch (error: any) {
       return new TBaseDTO<{ results: any[] }>(
         undefined,

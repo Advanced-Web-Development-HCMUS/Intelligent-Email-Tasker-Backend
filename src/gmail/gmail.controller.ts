@@ -24,6 +24,9 @@ import {
   ApiExcludeEndpoint,
 } from '@nestjs/swagger';
 import { GmailService } from './gmail.service';
+import { GeminiService } from '../ai/gemini.service';
+import { QdrantService } from '../ai/qdrant.service';
+import { AIProcessorService } from '../ai/ai-processor.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { FetchEmailsDto } from './dto/fetch-emails.dto';
 import { SendEmailDto } from './dto/send-email.dto';
@@ -45,6 +48,9 @@ export class GmailController {
   constructor(
     private readonly gmailService: GmailService,
     private readonly configService: ConfigService,
+    private readonly geminiService: GeminiService,
+    private readonly qdrantService: QdrantService,
+    private readonly aiProcessorService: AIProcessorService,
   ) {}
 
   /**
@@ -934,5 +940,166 @@ export class GmailController {
         count: number;
       }>;
     }>(result);
+  }
+
+  /**
+   * Fuzzy search emails using semantic search (Qdrant)
+   * Searches in subject, sender (name + email), and summary with typo tolerance
+   */
+  @Get('search/fuzzy')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Fuzzy search emails with typo tolerance using semantic search' })
+  @ApiQuery({ name: 'q', description: 'Search query', required: true })
+  @ApiQuery({ name: 'limit', required: false, type: Number, description: 'Maximum results (default: 50, max: 100)' })
+  @ApiResponse({
+    status: 200,
+    description: 'Fuzzy search results retrieved successfully',
+    type: TBaseDTO<{
+      results: Array<{
+        email: any;
+        relevanceScore: number;
+      }>;
+      total: number;
+    }>,
+  })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 400, description: 'Bad request - query is required' })
+  async fuzzySearch(
+    @Request() req: any,
+    @Query('q') query: string,
+    @Query('limit') limit?: string,
+  ): Promise<TBaseDTO<{
+    results: Array<{
+      email: any;
+      relevanceScore: number;
+    }>;
+    total: number;
+  }>> {
+    if (!query || query.trim().length === 0) {
+      return new TBaseDTO<{
+        results: Array<{
+          email: any;
+          relevanceScore: number;
+        }>;
+        total: number;
+      }>(
+        undefined,
+        undefined,
+        'Search query is required',
+      );
+    }
+
+    const userId = req.user.userId;
+    const limitNum = limit ? Math.min(parseInt(limit, 10), 100) : 50;
+
+    if (limitNum < 1) {
+      return new TBaseDTO<{
+        results: Array<{
+          email: any;
+          relevanceScore: number;
+        }>;
+        total: number;
+      }>(
+        undefined,
+        undefined,
+        'Limit must be a positive number',
+      );
+    }
+
+    try {
+      // Generate embedding for query
+      const queryEmbedding = await this.geminiService.generateEmbedding(query.trim());
+
+      // Search in Qdrant
+      const qdrantResults = await this.qdrantService.searchSimilarEmails(
+        queryEmbedding,
+        userId,
+        limitNum * 2, // Get more results to filter and enrich
+      );
+
+      // Filter by minimum score and enrich with full email data
+      const filteredResults = await Promise.all(
+        qdrantResults
+          .filter((r) => r.score > 0.3) // Lower threshold for better recall
+          .slice(0, limitNum)
+          .map(async (result) => {
+            // Get full email data from database
+            const emailId = result.payload.emailRawId;
+            const email = await this.aiProcessorService.getEmailById(emailId);
+
+            if (!email) {
+              return null;
+            }
+
+            // Get summary if available
+            const summary = await this.aiProcessorService.getEmailSummary(emailId);
+
+            return {
+              email: {
+                id: email.id,
+                gmailId: email.gmailId,
+                threadId: email.threadId,
+                from: email.from,
+                fromName: email.fromName,
+                to: email.to ? JSON.parse(email.to) : [],
+                cc: email.cc ? JSON.parse(email.cc) : [],
+                bcc: email.bcc ? JSON.parse(email.bcc) : [],
+                subject: email.subject,
+                snippet: email.snippet,
+                bodyText: email.bodyText,
+                bodyHtml: email.bodyHtml,
+                isRead: email.isRead,
+                isStarred: email.isStarred,
+                isImportant: email.isImportant,
+                labels: email.labels ? JSON.parse(email.labels) : [],
+                receivedAt: email.receivedAt,
+                sentAt: email.sentAt,
+                status: email.status || 'inbox',
+                snoozeUntil: email.snoozeUntil,
+                createdAt: email.createdAt,
+                updatedAt: email.updatedAt,
+                summary: summary
+                  ? {
+                      summary: summary.summary,
+                      keyPoints: summary.keyPoints ? JSON.parse(summary.keyPoints) : [],
+                      sentiment: summary.sentiment,
+                      category: summary.category,
+                      priority: summary.priority,
+                    }
+                  : null,
+              },
+              relevanceScore: Math.round(result.score * 100) / 100,
+            };
+          }),
+      );
+
+      // Filter out null results
+      const validResults = filteredResults.filter((r) => r !== null);
+
+      return new TBaseDTO<{
+        results: Array<{
+          email: any;
+          relevanceScore: number;
+        }>;
+        total: number;
+      }>({
+        results: validResults,
+        total: validResults.length,
+      });
+    } catch (error: any) {
+      return new TBaseDTO<{
+        results: Array<{
+          email: any;
+          relevanceScore: number;
+        }>;
+        total: number;
+      }>(
+        undefined,
+        undefined,
+        error.message || 'Search failed',
+      );
+    }
   }
 }

@@ -4,6 +4,7 @@ import { Repository } from 'typeorm';
 import { google } from 'googleapis';
 import { EmailRaw } from './entities/email-raw.entity';
 import { GmailToken } from './entities/gmail-token.entity';
+import { KanbanColumn } from './entities/kanban-column.entity';
 import { User } from '../auth/entities/user.entity';
 import { EmailSummary } from '../ai/entities/email-summary.entity';
 import { KafkaService } from '../kafka/kafka.service';
@@ -21,6 +22,8 @@ export class GmailService {
     private readonly emailRawRepository: Repository<EmailRaw>,
     @InjectRepository(GmailToken)
     private readonly gmailTokenRepository: Repository<GmailToken>,
+    @InjectRepository(KanbanColumn)
+    private readonly kanbanColumnRepository: Repository<KanbanColumn>,
     @InjectRepository(User)
     private readonly userRepository: Repository<User>,
     @InjectRepository(EmailSummary)
@@ -1239,11 +1242,12 @@ export class GmailService {
 
   /**
    * Update email status (for Kanban drag-and-drop)
+   * Also applies Gmail label if column is mapped to a label
    */
   async updateEmailStatus(
     userId: number,
     emailId: number,
-    status: KanbanStatus,
+    status: string, // Changed to string to support custom columns
   ): Promise<{ success: boolean; error?: string }> {
     try {
       const email = await this.emailRawRepository.findOne({
@@ -1254,6 +1258,11 @@ export class GmailService {
         return { success: false, error: 'Email not found' };
       }
 
+      // Get column configuration to check for Gmail label mapping
+      const column = await this.kanbanColumnRepository.findOne({
+        where: { userId, statusId: status, isActive: true },
+      });
+
       email.status = status;
       // If moving out of snoozed, clear snoozeUntil
       if (status !== KanbanStatus.SNOOZED) {
@@ -1261,6 +1270,40 @@ export class GmailService {
       }
 
       await this.emailRawRepository.save(email);
+
+      // Apply Gmail label if column is mapped to a label
+      if (column?.gmailLabel) {
+        try {
+          const gmail = await this.getGmailClient(userId);
+          const addLabelIds: string[] = [];
+          const removeLabelIds: string[] = [];
+
+          // Add the mapped label
+          addLabelIds.push(column.gmailLabel);
+
+          // Remove labels from other columns (optional - can be improved)
+          const otherColumns = await this.kanbanColumnRepository.find({
+            where: { userId, isActive: true },
+          });
+          otherColumns.forEach((col) => {
+            if (col.gmailLabel && col.statusId !== status && col.gmailLabel !== column.gmailLabel) {
+              removeLabelIds.push(col.gmailLabel);
+            }
+          });
+
+          await gmail.users.messages.modify({
+            userId: 'me',
+            id: email.gmailId,
+            requestBody: {
+              addLabelIds: addLabelIds.length > 0 ? addLabelIds : undefined,
+              removeLabelIds: removeLabelIds.length > 0 ? removeLabelIds : undefined,
+            },
+          });
+        } catch (gmailError: any) {
+          console.error('Failed to apply Gmail label:', gmailError);
+          // Don't fail the whole operation if Gmail label update fails
+        }
+      }
 
       return { success: true };
     } catch (error: any) {
@@ -1405,7 +1448,7 @@ export class GmailService {
   }
 
   /**
-   * Get Kanban board with all columns
+   * Get Kanban board with all columns (custom + default)
    */
   async getKanbanBoard(userId: number): Promise<{
     columns: Array<{
@@ -1413,9 +1456,18 @@ export class GmailService {
       name: string;
       emails: any[];
       count: number;
+      gmailLabel?: string;
+      order: number;
     }>;
   }> {
-    const statuses: Array<{ id: KanbanStatus; name: string }> = [
+    // Get user's custom columns
+    const customColumns = await this.kanbanColumnRepository.find({
+      where: { userId, isActive: true },
+      order: { order: 'ASC' },
+    });
+
+    // Default columns (if user hasn't created any custom columns)
+    const defaultStatuses: Array<{ id: KanbanStatus; name: string }> = [
       { id: KanbanStatus.INBOX, name: 'Inbox' },
       { id: KanbanStatus.TODO, name: 'To Do' },
       { id: KanbanStatus.IN_PROGRESS, name: 'In Progress' },
@@ -1423,17 +1475,38 @@ export class GmailService {
       { id: KanbanStatus.SNOOZED, name: 'Snoozed' },
     ];
 
+    // Use custom columns if available, otherwise use defaults
+    const columnsToUse =
+      customColumns.length > 0
+        ? customColumns.map((col) => ({
+            id: col.statusId,
+            name: col.name,
+            gmailLabel: col.gmailLabel,
+            order: col.order,
+          }))
+        : defaultStatuses.map((status, idx) => ({
+            id: status.id,
+            name: status.name,
+            gmailLabel: null,
+            order: idx,
+          }));
+
     const columns = await Promise.all(
-      statuses.map(async (status) => {
-        const result = await this.getEmailsByStatus(userId, status.id, 1, 100);
+      columnsToUse.map(async (col) => {
+        const result = await this.getEmailsByStatus(userId, col.id as any, 1, 100);
         return {
-          id: status.id,
-          name: status.name,
+          id: col.id,
+          name: col.name,
           emails: result.emails,
           count: result.total,
+          gmailLabel: col.gmailLabel || undefined,
+          order: col.order,
         };
       }),
     );
+
+    // Sort by order
+    columns.sort((a, b) => a.order - b.order);
 
     return { columns };
   }
@@ -1458,4 +1531,134 @@ export class GmailService {
     return { restored: result.affected || 0 };
   }
 
+  /**
+   * Get all Kanban columns for a user
+   */
+  async getKanbanColumns(userId: number): Promise<KanbanColumn[]> {
+    return await this.kanbanColumnRepository.find({
+      where: { userId, isActive: true },
+      order: { order: 'ASC' },
+    });
+  }
+
+  /**
+   * Create a new Kanban column
+   */
+  async createKanbanColumn(
+    userId: number,
+    name: string,
+    statusId: string,
+    order?: number,
+    gmailLabel?: string,
+  ): Promise<KanbanColumn> {
+    // Check if statusId already exists
+    const existing = await this.kanbanColumnRepository.findOne({
+      where: { userId, statusId },
+    });
+
+    if (existing) {
+      throw new Error(`Column with statusId "${statusId}" already exists`);
+    }
+
+    // Get max order if not provided
+    if (order === undefined) {
+      const maxOrder = await this.kanbanColumnRepository
+        .createQueryBuilder('col')
+        .select('MAX(col.order)', 'max')
+        .where('col.userId = :userId', { userId })
+        .getRawOne();
+      order = (maxOrder?.max || 0) + 1;
+    }
+
+    const column = this.kanbanColumnRepository.create({
+      userId,
+      name,
+      statusId,
+      order,
+      gmailLabel: gmailLabel || null,
+      isActive: true,
+      isDefault: false,
+    });
+
+    return await this.kanbanColumnRepository.save(column);
+  }
+
+  /**
+   * Update a Kanban column (rename, reorder, update label mapping)
+   */
+  async updateKanbanColumn(
+    userId: number,
+    columnId: number,
+    updates: {
+      name?: string;
+      order?: number;
+      gmailLabel?: string;
+      isActive?: boolean;
+    },
+  ): Promise<KanbanColumn> {
+    const column = await this.kanbanColumnRepository.findOne({
+      where: { id: columnId, userId },
+    });
+
+    if (!column) {
+      throw new Error('Column not found');
+    }
+
+    if (column.isDefault) {
+      throw new Error('Cannot modify default columns');
+    }
+
+    if (updates.name !== undefined) {
+      column.name = updates.name;
+    }
+    if (updates.order !== undefined) {
+      column.order = updates.order;
+    }
+    if (updates.gmailLabel !== undefined) {
+      column.gmailLabel = updates.gmailLabel || null;
+    }
+    if (updates.isActive !== undefined) {
+      column.isActive = updates.isActive;
+    }
+
+    return await this.kanbanColumnRepository.save(column);
+  }
+
+  /**
+   * Delete a Kanban column
+   */
+  async deleteKanbanColumn(userId: number, columnId: number): Promise<{ success: boolean; error?: string }> {
+    try {
+      const column = await this.kanbanColumnRepository.findOne({
+        where: { id: columnId, userId },
+      });
+
+      if (!column) {
+        return { success: false, error: 'Column not found' };
+      }
+
+      if (column.isDefault) {
+        return { success: false, error: 'Cannot delete default columns' };
+      }
+
+      // Move emails from this column back to inbox
+      await this.emailRawRepository
+        .createQueryBuilder()
+        .update(EmailRaw)
+        .set({ status: KanbanStatus.INBOX })
+        .where('userId = :userId', { userId })
+        .andWhere('status = :status', { status: column.statusId })
+        .execute();
+
+      await this.kanbanColumnRepository.remove(column);
+
+      return { success: true };
+    } catch (error: any) {
+      console.error('Delete Kanban column error:', error);
+      return {
+        success: false,
+        error: error.message || 'Failed to delete column',
+      };
+    }
+  }
 }

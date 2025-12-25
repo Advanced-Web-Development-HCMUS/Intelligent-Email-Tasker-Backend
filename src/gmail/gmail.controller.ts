@@ -2,6 +2,7 @@ import {
   Controller,
   Post,
   Get,
+  Put,
   Delete,
   Body,
   Query,
@@ -34,6 +35,8 @@ import { ReplyEmailDto } from './dto/reply-email.dto';
 import { ModifyEmailDto } from './dto/modify-email.dto';
 import { UpdateEmailStatusDto, KanbanStatus } from './dto/update-email-status.dto';
 import { SnoozeEmailDto } from './dto/snooze-email.dto';
+import { CreateKanbanColumnDto } from './dto/create-kanban-column.dto';
+import { UpdateKanbanColumnDto } from './dto/update-kanban-column.dto';
 import { TBaseDTO } from '../common/dto/base.dto';
 import { GGJParseIntPipe } from '../common/pipes/parse-int.pipe';
 import { google } from 'googleapis';
@@ -252,7 +255,7 @@ export class GmailController {
   async syncEmails(
     @Request() req: any,
   ): Promise<TBaseDTO<{ synced: number; message: string }>> {
-    const userId = req.user.userId;
+      const userId = req.user.userId;
     const result = await this.gmailService.fetchAndStoreEmails(userId, 50);
 
     if (result.success) {
@@ -1100,6 +1103,133 @@ export class GmailController {
         undefined,
         error.message || 'Search failed',
       );
+    }
+  }
+
+  /**
+   * Get all Kanban columns for current user
+   */
+  @Get('kanban/columns')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Get all Kanban columns configuration' })
+  @ApiResponse({
+    status: 200,
+    description: 'Kanban columns retrieved successfully',
+    type: TBaseDTO<Array<{
+      id: number;
+      name: string;
+      statusId: string;
+      order: number;
+      gmailLabel: string | null;
+      isActive: boolean;
+      isDefault: boolean;
+    }>>,
+  })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  async getKanbanColumns(@Request() req: any): Promise<TBaseDTO<any[]>> {
+    const userId = req.user.userId;
+    const columns = await this.gmailService.getKanbanColumns(userId);
+    return new TBaseDTO<any[]>(columns);
+  }
+
+  /**
+   * Create a new Kanban column
+   */
+  @Post('kanban/columns')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Create a new Kanban column' })
+  @ApiResponse({
+    status: 200,
+    description: 'Column created successfully',
+    type: TBaseDTO<any>,
+  })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 400, description: 'Bad request' })
+  async createKanbanColumn(
+    @Request() req: any,
+    @Body() createColumnDto: CreateKanbanColumnDto,
+  ): Promise<TBaseDTO<any>> {
+    try {
+      const userId = req.user.userId;
+      const column = await this.gmailService.createKanbanColumn(
+        userId,
+        createColumnDto.name,
+        createColumnDto.statusId,
+        createColumnDto.order,
+        createColumnDto.gmailLabel,
+      );
+      return new TBaseDTO<any>(column);
+    } catch (error: any) {
+      return new TBaseDTO<any>(undefined, undefined, error.message || 'Failed to create column');
+    }
+  }
+
+  /**
+   * Update a Kanban column (rename, reorder, update label mapping)
+   */
+  @Put('kanban/columns/:id')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Update a Kanban column' })
+  @ApiParam({ name: 'id', description: 'Column ID', type: Number, example: 1 })
+  @ApiResponse({
+    status: 200,
+    description: 'Column updated successfully',
+    type: TBaseDTO<any>,
+  })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 404, description: 'Column not found' })
+  async updateKanbanColumn(
+    @Request() req: any,
+    @Param('id', GGJParseIntPipe) columnId: number,
+    @Body() updateColumnDto: UpdateKanbanColumnDto,
+  ): Promise<TBaseDTO<any>> {
+    try {
+      const userId = req.user.userId;
+      const column = await this.gmailService.updateKanbanColumn(userId, columnId, {
+        name: updateColumnDto.name,
+        order: updateColumnDto.order,
+        gmailLabel: updateColumnDto.gmailLabel,
+        isActive: updateColumnDto.isActive,
+      });
+      return new TBaseDTO<any>(column);
+    } catch (error: any) {
+      return new TBaseDTO<any>(undefined, undefined, error.message || 'Failed to update column');
+    }
+  }
+
+  /**
+   * Delete a Kanban column
+   */
+  @Delete('kanban/columns/:id')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Delete a Kanban column' })
+  @ApiParam({ name: 'id', description: 'Column ID', type: Number, example: 1 })
+  @ApiResponse({
+    status: 200,
+    description: 'Column deleted successfully',
+    type: TBaseDTO<{ success: boolean }>,
+  })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 404, description: 'Column not found' })
+  async deleteKanbanColumn(
+    @Request() req: any,
+    @Param('id', GGJParseIntPipe) columnId: number,
+  ): Promise<TBaseDTO<{ success: boolean }>> {
+    const userId = req.user.userId;
+    const result = await this.gmailService.deleteKanbanColumn(userId, columnId);
+
+    if (result.success) {
+      return new TBaseDTO<{ success: boolean }>({ success: true });
+    } else {
+      return new TBaseDTO<{ success: boolean }>(undefined, undefined, result.error || 'Failed to delete column');
     }
   }
 }

@@ -131,10 +131,9 @@ export class AIProcessorService {
     await this.emailMetadataRepository.save(emailMetadata);
 
     // 7. Generate embedding and store in Qdrant
-    // Include subject, sender (name + email), and summary for comprehensive search
+    // Use subject + actual email content for semantic search (not AI summary)
     try {
-      const senderInfo = `${email.fromName || ''} ${email.from || ''}`.trim();
-      const embeddingText = `${email.subject || ''} ${senderInfo} ${summaryData.summary || ''}`.trim();
+      const embeddingText = `${email.subject || ''}\n\n${emailContent}`.trim();
       
       const embedding = await this.geminiService.generateEmbedding(embeddingText);
 
@@ -148,7 +147,7 @@ export class AIProcessorService {
         {
           emailRawId: emailId,
           subject: email.subject || '',
-          summary: summaryData.summary || '',
+          content: emailContent || '',
           from: email.from || '',
           fromName: email.fromName || '',
           userId: email.userId,

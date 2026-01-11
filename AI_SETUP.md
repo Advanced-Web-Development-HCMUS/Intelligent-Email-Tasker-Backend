@@ -41,9 +41,11 @@ KAFKA_TOPIC_EMAIL_FETCHED=email-fetched
 
 # Gemini API
 GEMINI_API_KEY=your-gemini-api-key
+GROQ_API_KEY=your-groq-api-key
 
-# Qdrant Configuration
-QDRANT_URL=http://localhost:6333
+# Qdrant Configuration (using gRPC)
+QDRANT_HOST=localhost
+QDRANT_PORT=6334
 ```
 
 ### 3. Get Gemini API Key
@@ -154,8 +156,9 @@ POST /ai/search
 
 ### Qdrant errors
 - Check if Qdrant is running: `docker-compose ps qdrant`
-- Verify `QDRANT_URL` in `.env`
+- Verify `QDRANT_HOST` and `QDRANT_PORT` in `.env`
 - Check Qdrant health: `curl http://localhost:6333/health`
+- Verify gRPC port 6334 is accessible
 
 ### Emails not processing
 - Check Kafka consumer logs

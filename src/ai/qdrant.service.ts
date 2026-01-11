@@ -1,189 +1,209 @@
 import { Injectable, OnModuleInit } from '@nestjs/common';
-import { QdrantClient } from '@qdrant/js-client-rest';
+import { QdrantClient } from '@qdrant/js-client-grpc';
 
-/**
- * Service for Qdrant vector database integration
- */
 @Injectable()
 export class QdrantService implements OnModuleInit {
   private client: QdrantClient;
   private collectionName = 'emails';
 
   constructor() {
-    const qdrantUrl = process.env.QDRANT_URL || 'http://localhost:6333';
-    this.client = new QdrantClient({ url: qdrantUrl });
+    const qdrantHost = process.env.QDRANT_HOST || 'localhost';
+    const qdrantPort = parseInt(process.env.QDRANT_PORT || '6334');
+
+    this.client = new QdrantClient({
+      host: qdrantHost,
+      port: qdrantPort,
+    });
   }
 
-  /**
-   * Initialize Qdrant collection
-   */
   async onModuleInit(): Promise<void> {
-    try {
-      await this.ensureCollection();
-      console.log('Qdrant collection initialized');
-    } catch (error) {
-      console.error('Failed to initialize Qdrant:', error);
-    }
+    await this.ensureCollection();
   }
 
-  /**
-   * Ensure collection exists
-   */
   private async ensureCollection(): Promise<void> {
     try {
-      // Check if Qdrant is accessible
-      try {
-        await this.client.getCollections();
-      } catch (error: any) {
-        console.error('Cannot connect to Qdrant:', error.message);
-        console.error('Please ensure Qdrant is running: docker-compose up -d qdrant');
-        throw new Error(`Qdrant connection failed: ${error.message}`);
-      }
-
-      const collections = await this.client.getCollections();
-      const exists = collections.collections.some(
-        (c) => c.name === this.collectionName,
-      );
+      // 1. Fix: Use api('collections')
+      const result = await this.client.api('collections').list({});
+      const exists = result.collections.some((c) => c.name === this.collectionName);
 
       if (!exists) {
-        await this.client.createCollection(this.collectionName, {
-          vectors: {
-            size: 3072, // Embedding dimension (can be adjusted based on embedding model)
-            distance: 'Cosine',
-          },
-        });
-        console.log(`Created Qdrant collection: ${this.collectionName}`);
+        await this.createCollection();
       } else {
-        console.log(`Qdrant collection ${this.collectionName} already exists`);
+        console.log(`Collection ${this.collectionName} exists.`);
       }
     } catch (error: any) {
-      if (error.status === 409 || error.message?.includes('already exists')) {
-        // Collection already exists, that's fine
-        console.log(`Qdrant collection ${this.collectionName} already exists`);
-      } else {
-        console.error('Failed to ensure Qdrant collection:', error);
-        throw error;
-      }
+      console.error('Qdrant connection error:', error.message);
     }
   }
 
-  /**
-   * Store email embedding in Qdrant
-   * @param emailId - Email ID (must be positive integer)
-   * @param embedding - Vector embedding array
-   * @param payload - Metadata to store with the embedding
-   * @returns The point ID (integer) used in Qdrant
-   */
+  private async createCollection(): Promise<void> {
+    // 2. Fix: Use camelCase 'collectionName'
+    await this.client.api('collections').create({
+      collectionName: this.collectionName,
+      vectorsConfig: {
+        config: {
+          case: 'params',
+          value: {
+            size: BigInt(768), // 3. Fix: Size usually expects BigInt or number depending on proto version
+            distance: 1, // 1 = Cosine distance in Qdrant Distance enum
+          },
+        },
+      },
+    });
+    console.log(`Created Qdrant collection: ${this.collectionName}`);
+  }
+
   async storeEmailEmbedding(
     emailId: number,
     embedding: number[],
-    payload: {
-      emailRawId: number;
-      subject: string;
-      summary: string;
-      from: string;
-      fromName?: string;
-      userId: number;
-    },
+    payload: any,
   ): Promise<number> {
     try {
-      await this.ensureCollection();
-
-      // Qdrant only accepts integer or UUID for point IDs, not strings
-      // Use emailId directly as integer point ID
-      if (!Number.isInteger(emailId) || emailId <= 0) {
-        throw new Error(`Invalid emailId: ${emailId}. Must be a positive integer.`);
-      }
-
-      const pointId: number = emailId;
-
-      await this.client.upsert(this.collectionName, {
+      await this.client.api('points').upsert({
+        collectionName: this.collectionName,
         wait: true,
         points: [
           {
-            id: pointId, // Integer ID, not string
-            vector: embedding,
-            payload: {
-              emailRawId: payload.emailRawId,
-              subject: payload.subject,
-              summary: payload.summary,
-              from: payload.from,
-              fromName: payload.fromName || '',
-              userId: payload.userId,
-              timestamp: new Date().toISOString(),
+            // 4. Fix: 'PointId' is a strict oneof wrapper
+            id: {
+              pointIdOptions: {
+                case: 'num',
+                value: BigInt(emailId), // 5. Fix: IDs are uint64 (BigInt)
+              },
             },
+            // 6. Fix: 'Vectors' is a strict oneof wrapper
+            vectors: {
+              vectorsOptions: {
+                case: 'vector',
+                value: { data: embedding },
+              },
+            },
+            payload: this.mapPayload(payload),
           },
         ],
       });
 
-      console.log(`Successfully stored embedding in Qdrant for email ${emailId} with point ID ${pointId}`);
-      return pointId; // Return integer, not string
+      return emailId;
     } catch (error: any) {
-      console.error('Failed to store embedding in Qdrant:', error);
-      console.error('Error details:', {
-        message: error.message,
-        status: error.status,
-        statusText: error.statusText,
-        emailId,
-        embeddingSize: embedding.length,
-      });
+      console.error('Failed to store embedding:', error);
       throw new Error(`Qdrant storage failed: ${error.message}`);
     }
   }
 
-  /**
-   * Search similar emails
-   */
   async searchSimilarEmails(
     queryEmbedding: number[],
     userId: number,
     limit: number = 10,
-  ): Promise<
-    Array<{
-      id: number; // Changed from string to number since we use integer IDs
-      score: number;
-      payload: any;
-    }>
-  > {
+  ): Promise<Array<{ id: number; score: number; payload: any }>> {
     try {
-      const result = await this.client.search(this.collectionName, {
+      const threshold = parseFloat(process.env.QDRANT_SCORE_THRESHOLD || '0.5');
+
+      const result = await this.client.api('points').search({
+        collectionName: this.collectionName,
         vector: queryEmbedding,
-        limit,
+        limit: BigInt(limit), // Limit must be a BigInt
+        scoreThreshold: threshold,
+        // FIX: Wrap 'enable' inside selectorOptions
+        withPayload: {
+          selectorOptions: {
+            case: 'enable',
+            value: true,
+          },
+        },
         filter: {
           must: [
             {
-              key: 'userId',
-              match: { value: userId },
+              conditionOneOf: {
+                case: 'field',
+                value: {
+                  key: 'userId',
+                  match: {
+                    matchValue: {
+                      case: 'integer',
+                      value: BigInt(userId), // integer match must be BigInt
+                    },
+                  },
+                },
+              },
             },
           ],
         },
       });
 
-      return result.map((point) => ({
-        id: point.id as number, // Qdrant returns integer ID
-        score: point.score || 0,
-        payload: point.payload || {},
-      }));
+      return result.result.map((point) => {
+        // Handle Point ID (which is also a OneOf)
+        let id = 0;
+        if (point.id?.pointIdOptions?.case === 'num') {
+          id = Number(point.id.pointIdOptions.value);
+        }
+
+        return {
+          id: id,
+          score: point.score,
+          payload: point.payload ? this.mapToObj(point.payload) : {},
+        };
+      });
     } catch (error: any) {
       console.error('Qdrant search error:', error);
       throw new Error(`Qdrant search failed: ${error.message}`);
     }
   }
 
-  /**
-   * Delete email embedding
-   */
   async deleteEmailEmbedding(emailId: number): Promise<void> {
     try {
-      // Use numeric ID to match storeEmailEmbedding
-      const pointId = emailId;
-      await this.client.delete(this.collectionName, {
+      await this.client.api('points').delete({
+        collectionName: this.collectionName,
         wait: true,
-        points: [pointId],
+        points: {
+          pointsSelectorOneOf: {
+            case: 'points',
+            value: {
+              ids: [
+                {
+                  pointIdOptions: {
+                    case: 'num',
+                    value: BigInt(emailId),
+                  },
+                },
+              ],
+            },
+          },
+        },
       });
     } catch (error: any) {
-      console.error('Failed to delete embedding from Qdrant:', error);
+      console.error('Failed to delete embedding:', error);
     }
   }
-}
 
+  // --- Helpers ---
+
+  private mapPayload(payload: any): Record<string, any> {
+    const result: Record<string, any> = {};
+    for (const [key, value] of Object.entries(payload)) {
+      if (typeof value === 'string') {
+        result[key] = { kind: { case: 'stringValue', value: value } };
+      } else if (typeof value === 'number') {
+        if (Number.isInteger(value)) {
+          result[key] = { kind: { case: 'integerValue', value: BigInt(value) } };
+        } else {
+          result[key] = { kind: { case: 'doubleValue', value: value } };
+        }
+      } else if (typeof value === 'boolean') {
+        result[key] = { kind: { case: 'boolValue', value: value } };
+      }
+    }
+    return result;
+  }
+
+  private mapToObj(grpcMap: Record<string, any>): any {
+    const result: any = {};
+    for (const [key, value] of Object.entries(grpcMap)) {
+      if (value.kind?.case === 'stringValue') result[key] = value.kind.value;
+      else if (value.kind?.case === 'integerValue')
+        result[key] = Number(value.kind.value);
+      else if (value.kind?.case === 'doubleValue') result[key] = value.kind.value;
+      else if (value.kind?.case === 'boolValue') result[key] = value.kind.value;
+    }
+    return result;
+  }
+}

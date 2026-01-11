@@ -256,7 +256,7 @@ export class GmailController {
     @Request() req: any,
   ): Promise<TBaseDTO<{ synced: number; message: string }>> {
       const userId = req.user.userId;
-    const result = await this.gmailService.fetchAndStoreEmails(userId, 50);
+    const result = await this.gmailService.fetchAndStoreEmails(userId, 10);
 
     if (result.success) {
       return new TBaseDTO<{ synced: number; message: string }>({

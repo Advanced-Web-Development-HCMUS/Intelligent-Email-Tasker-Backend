@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import Groq from 'groq-sdk';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 
 /**
  * Service for Groq AI integration (using GeminiService name for compatibility)
@@ -7,19 +8,30 @@ import Groq from 'groq-sdk';
 @Injectable()
 export class GeminiService {
   private groq: Groq;
+  private genAI: GoogleGenerativeAI | null = null;
   private model: string = 'llama-3.3-70b-versatile'; // Groq model
 
   constructor() {
-    const apiKey = process.env.GROQ_API_KEY || process.env.GEMINI_API_KEY;
-    if (!apiKey) {
+    const groqApiKey = process.env.GROQ_API_KEY || process.env.GEMINI_API_KEY;
+    if (!groqApiKey) {
       console.warn('GROQ_API_KEY not set. Groq features will be disabled.');
-      return;
+    } else {
+      try {
+        this.groq = new Groq({ apiKey: groqApiKey });
+      } catch (error) {
+        console.error('Failed to initialize Groq:', error);
+      }
     }
 
-    try {
-      this.groq = new Groq({ apiKey });
-    } catch (error) {
-      console.error('Failed to initialize Groq:', error);
+    // Initialize Gemini for embeddings
+    const geminiApiKey = process.env.GEMINI_API_KEY;
+    if (geminiApiKey) {
+      try {
+        this.genAI = new GoogleGenerativeAI(geminiApiKey);
+        console.log('Gemini API initialized for embeddings');
+      } catch (error) {
+        console.error('Failed to initialize Gemini:', error);
+      }
     }
   }
 
@@ -186,29 +198,30 @@ Respond in JSON format:
   }
 
   /**
-   * Generate embedding for semantic search
-   * Note: Groq doesn't have native embedding models, so we use a workaround
-   * or fallback to text-based similarity. For production, consider using
-   * a dedicated embedding service or keep using Gemini for embeddings.
+   * Generate embedding for semantic search using Gemini
    */
   async generateEmbedding(text: string): Promise<number[]> {
-    if (!this.groq) {
-      throw new Error('Groq API is not configured');
+    if (!this.genAI) {
+      console.warn('Gemini API not configured, using fallback embedding');
+      return this.simpleTextToEmbedding(text);
     }
 
     try {
-      // Groq doesn't have embedding models, so we'll use a workaround:
-      // Generate a text representation and convert to simple embedding
-      // For better results, you might want to use a dedicated embedding service
-      // or keep using Gemini embedding model for this specific use case
-      
-      // Simple workaround: use text hash-based embedding (not ideal but functional)
-      // For production, consider using OpenAI embeddings or keep Gemini for embeddings
-      const textHash = this.simpleTextToEmbedding(text);
-      return textHash;
+      // Use Gemini's text-embedding-004 model for semantic embeddings
+      const model = this.genAI.getGenerativeModel({ model: 'text-embedding-004' });
+      const result = await model.embedContent(text);
+      const embedding = result.embedding.values;
+
+      if (!embedding || embedding.length === 0) {
+        throw new Error('Empty embedding returned');
+      }
+
+      console.log(`Generated embedding with ${embedding.length} dimensions`);
+      return embedding;
     } catch (error: any) {
-      console.warn('Embedding generation failed:', error.message);
-      throw new Error('Failed to generate embedding');
+      console.error('Gemini embedding failed:', error.message);
+      console.warn('Falling back to simple embedding');
+      return this.simpleTextToEmbedding(text);
     }
   }
 
@@ -220,7 +233,7 @@ Respond in JSON format:
     // Create a simple embedding based on text characteristics
     // This is a placeholder - for real embeddings, use a dedicated service
     const words = text.toLowerCase().split(/\s+/);
-    const embedding: number[] = new Array(3072).fill(0);
+    const embedding: number[] = new Array(768).fill(0); // Changed to 768 to match common embedding dimensions
     
     // Simple hash-based embedding
     words.forEach((word, idx) => {

@@ -1,8 +1,9 @@
-import { IsEnum, IsNotEmpty } from 'class-validator';
+import { IsNotEmpty, IsString } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 
 /**
- * Valid Kanban status values
+ * Common Kanban status values (for reference)
+ * Custom columns can use any string as statusId
  */
 export enum KanbanStatus {
   INBOX = 'inbox',
@@ -17,12 +18,11 @@ export enum KanbanStatus {
  */
 export class UpdateEmailStatusDto {
   @ApiProperty({
-    description: 'New status for the email',
-    enum: KanbanStatus,
-    example: KanbanStatus.TODO,
+    description: 'New status for the email (column statusId)',
+    example: 'todo',
   })
   @IsNotEmpty({ message: 'Status is required' })
-  @IsEnum(KanbanStatus, { message: 'Status must be one of: inbox, todo, in_progress, done, snoozed' })
-  status: KanbanStatus;
+  @IsString({ message: 'Status must be a string' })
+  status: string;
 }
 

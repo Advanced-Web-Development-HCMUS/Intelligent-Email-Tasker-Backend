@@ -3,6 +3,7 @@ import { PassportStrategy } from '@nestjs/passport';
 import { Strategy, VerifyCallback } from 'passport-google-oauth20';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
+import { ConfigService } from '@nestjs/config';
 import { User } from '../entities/user.entity';
 import { GmailToken } from '../../gmail/entities/gmail-token.entity';
 
@@ -25,20 +26,29 @@ export class GoogleStrategy extends PassportStrategy(Strategy, 'google') {
     private readonly userRepository: Repository<User>,
     @InjectRepository(GmailToken)
     private readonly gmailTokenRepository: Repository<GmailToken>,
+    private readonly configService: ConfigService,
   ) {
+    // Match Gmail flow config exactly
+    const googleRedirectUri =
+      configService.get<string>('GOOGLE_REDIRECT_URI') ||
+      `http://localhost:${configService.get<string>('PORT') || '3001'}/auth/oauth/callback`;
+
+    console.log('🔍 GoogleStrategy Config:', {
+      clientID: configService.get<string>('GOOGLE_CLIENT_ID')?.substring(0, 20) + '...',
+      callbackURL: googleRedirectUri,
+      port: configService.get<string>('PORT'),
+    });
+
     super({
-      clientID: process.env.GOOGLE_CLIENT_ID,
-      clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-      callbackURL:
-        process.env.GOOGLE_REDIRECT_URI ||
-        'http://localhost:3000/auth/google/callback',
+      clientID: configService.get<string>('GOOGLE_CLIENT_ID'),
+      clientSecret: configService.get<string>('GOOGLE_CLIENT_SECRET'),
+      callbackURL: googleRedirectUri,
       scope: [
         'email',
         'profile',
-        // Gmail API scopes for full email access
-        'https://www.googleapis.com/auth/gmail.readonly',
-        'https://www.googleapis.com/auth/gmail.modify',
-        'https://www.googleapis.com/auth/gmail.send',
+        // NOTE: Gmail scopes removed from initial auth
+        // Users must use /gmail/auth to connect Gmail (incremental authorization)
+        // This ensures refresh_token is obtained when Gmail access is needed
       ],
       accessType: 'offline', // CRITICAL: Get refresh token
       prompt: 'consent', // Force consent screen to get refresh token every time
@@ -63,6 +73,21 @@ export class GoogleStrategy extends PassportStrategy(Strategy, 'google') {
     done: VerifyCallback,
   ): Promise<any> {
     try {
+      // 🔍 DEBUG: Log what Google returned
+      console.log('=== GOOGLE OAUTH VALIDATE ===');
+      console.log(
+        'accessToken:',
+        accessToken ? `${accessToken.substring(0, 20)}...` : 'NULL',
+      );
+      console.log(
+        'refreshToken:',
+        refreshToken ? `${refreshToken.substring(0, 20)}...` : 'NULL ❌',
+      );
+      console.log('profile.id:', profile.id);
+      console.log('profile.emails:', profile.emails);
+      console.log('profile._json.scope:', profile._json?.scope);
+      console.log('=============================');
+
       const { id: googleId, emails, displayName } = profile;
 
       if (!emails || emails.length === 0) {
@@ -105,8 +130,9 @@ export class GoogleStrategy extends PassportStrategy(Strategy, 'google') {
         }
       }
 
-      // Save Gmail OAuth tokens - CRITICAL for Gmail API access
-      // Only update if we got a refresh token (not always provided)
+      // Save Gmail OAuth tokens - ONLY if refresh token provided
+      // NOTE: With incremental authorization (minimal scopes in initial auth),
+      // refresh_token will NOT be provided here. Users must connect Gmail separately.
       if (refreshToken) {
         const expiryDate = new Date();
         expiryDate.setHours(expiryDate.getHours() + 1); // Access tokens typically expire in 1 hour
@@ -117,12 +143,14 @@ export class GoogleStrategy extends PassportStrategy(Strategy, 'google') {
 
         if (gmailToken) {
           // Update existing token
+          console.log('Updating existing token');
           gmailToken.refreshToken = refreshToken;
           gmailToken.accessToken = accessToken;
           gmailToken.accessTokenExpiry = expiryDate;
           await this.gmailTokenRepository.save(gmailToken);
         } else {
           // Create new token record
+          console.log('Creating new token record');
           gmailToken = this.gmailTokenRepository.create({
             userId: user.id,
             refreshToken: refreshToken,
@@ -132,11 +160,11 @@ export class GoogleStrategy extends PassportStrategy(Strategy, 'google') {
           await this.gmailTokenRepository.save(gmailToken);
         }
       } else if (!refreshToken) {
-        // Warning: No refresh token received
-        // This can happen if user previously authorized and prompt=consent not set
-        console.warn(
-          `No refresh token received for user ${user.email}. ` +
-            'User may need to re-authorize or revoke access and try again.',
+        // Expected: No refresh token in initial auth flow (incremental authorization)
+        // User should connect Gmail separately via /gmail/auth to get refresh_token
+        console.log(
+          `✓ User ${user.email} signed in with Google (no Gmail access yet). ` +
+            'User can connect Gmail later via /gmail/auth endpoint.',
         );
       }
 

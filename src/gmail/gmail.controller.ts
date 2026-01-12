@@ -32,6 +32,7 @@ import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { FetchEmailsDto } from './dto/fetch-emails.dto';
 import { SendEmailDto } from './dto/send-email.dto';
 import { ReplyEmailDto } from './dto/reply-email.dto';
+import { ForwardEmailDto } from './dto/forward-email.dto';
 import { ModifyEmailDto } from './dto/modify-email.dto';
 import { UpdateEmailStatusDto, KanbanStatus } from './dto/update-email-status.dto';
 import { SnoozeEmailDto } from './dto/snooze-email.dto';
@@ -632,6 +633,49 @@ export class GmailController {
         undefined,
         undefined,
         result.error || 'Failed to reply to email',
+      );
+    }
+  }
+
+  /**
+   * Forward an email to new recipients
+   */
+  @Post('emails/:id/forward')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Forward an email' })
+  @ApiParam({ name: 'id', description: 'Email ID', type: Number, example: 1 })
+  @ApiResponse({
+    status: 200,
+    description: 'Email forwarded successfully',
+    type: TBaseDTO<{ messageId: string }>,
+  })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 404, description: 'Email not found' })
+  async forwardEmail(
+    @Request() req: any,
+    @Param('id', GGJParseIntPipe) emailId: number,
+    @Body() forwardEmailDto: ForwardEmailDto,
+  ): Promise<TBaseDTO<{ messageId: string }>> {
+    const userId = req.user.userId;
+    const result = await this.gmailService.forwardEmail(
+      userId,
+      emailId,
+      forwardEmailDto.to,
+      forwardEmailDto.message,
+      forwardEmailDto.cc,
+    );
+
+    if (result.success && result.messageId) {
+      return new TBaseDTO<{ messageId: string }>({
+        messageId: result.messageId,
+      });
+    } else {
+      return new TBaseDTO<{ messageId: string }>(
+        undefined,
+        undefined,
+        result.error || 'Failed to forward email',
       );
     }
   }

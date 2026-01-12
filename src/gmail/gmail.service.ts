@@ -708,6 +708,12 @@ export class GmailService {
       });
     }
 
+    // Exclude snoozed emails that are still snoozed
+    queryBuilder.andWhere(
+      '(email.status != :snoozedStatus OR email.snoozeUntil IS NULL OR email.snoozeUntil <= :now)',
+      { snoozedStatus: KanbanStatus.SNOOZED, now: new Date() },
+    );
+
     // Get total count
     const total = await queryBuilder.getCount();
 

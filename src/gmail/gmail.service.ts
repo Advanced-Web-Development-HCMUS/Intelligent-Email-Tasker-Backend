@@ -1448,7 +1448,7 @@ export class GmailService {
   }
 
   /**
-   * Get Kanban board with all columns (custom + default)
+   * Get Kanban board with all columns (from database)
    */
   async getKanbanBoard(userId: number): Promise<{
     columns: Array<{
@@ -1460,42 +1460,22 @@ export class GmailService {
       order: number;
     }>;
   }> {
-    // Get user's custom columns
-    const customColumns = await this.kanbanColumnRepository.find({
+    // Ensure user has default columns initialized
+    await this.initDefaultColumnsForUser(userId);
+
+    // Get user's columns from database
+    const userColumns = await this.kanbanColumnRepository.find({
       where: { userId, isActive: true },
       order: { order: 'ASC' },
     });
 
-    // Default columns (if user hasn't created any custom columns)
-    const defaultStatuses: Array<{ id: KanbanStatus; name: string }> = [
-      { id: KanbanStatus.INBOX, name: 'Inbox' },
-      { id: KanbanStatus.TODO, name: 'To Do' },
-      { id: KanbanStatus.IN_PROGRESS, name: 'In Progress' },
-      { id: KanbanStatus.DONE, name: 'Done' },
-      { id: KanbanStatus.SNOOZED, name: 'Snoozed' },
-    ];
-
-    // Use custom columns if available, otherwise use defaults
-    const columnsToUse =
-      customColumns.length > 0
-        ? customColumns.map((col) => ({
-            id: col.statusId,
-            name: col.name,
-            gmailLabel: col.gmailLabel,
-            order: col.order,
-          }))
-        : defaultStatuses.map((status, idx) => ({
-            id: status.id,
-            name: status.name,
-            gmailLabel: null,
-            order: idx,
-          }));
-
+    // Build columns with emails
     const columns = await Promise.all(
-      columnsToUse.map(async (col) => {
-        const result = await this.getEmailsByStatus(userId, col.id as any, 1, 100);
+      userColumns.map(async (col) => {
+        const result = await this.getEmailsByStatus(userId, col.statusId as any, 1, 100);
         return {
-          id: col.id,
+          id: col.statusId,
+          dbId: col.id, // Database ID for update/delete operations
           name: col.name,
           emails: result.emails,
           count: result.total,
@@ -1532,9 +1512,49 @@ export class GmailService {
   }
 
   /**
+   * Initialize default Kanban columns for a new user
+   * Creates: Inbox, To Do, In Progress, Done
+   */
+  async initDefaultColumnsForUser(userId: number): Promise<void> {
+    // Check if user already has any columns
+    const existingColumns = await this.kanbanColumnRepository.count({
+      where: { userId },
+    });
+
+    if (existingColumns > 0) {
+      return; // User already has columns, don't create defaults
+    }
+
+    // Default columns to create
+    const defaultColumns = [
+      { name: 'Inbox', statusId: 'inbox', order: 0 },
+      { name: 'To Do', statusId: 'todo', order: 1 },
+      { name: 'In Progress', statusId: 'in_progress', order: 2 },
+      { name: 'Done', statusId: 'done', order: 3 },
+    ];
+
+    // Create all default columns
+    for (const col of defaultColumns) {
+      const column = this.kanbanColumnRepository.create({
+        userId,
+        name: col.name,
+        statusId: col.statusId,
+        order: col.order,
+        gmailLabel: null,
+        isActive: true,
+        isDefault: true,
+      });
+      await this.kanbanColumnRepository.save(column);
+    }
+  }
+
+  /**
    * Get all Kanban columns for a user
    */
   async getKanbanColumns(userId: number): Promise<KanbanColumn[]> {
+    // Ensure user has default columns
+    await this.initDefaultColumnsForUser(userId);
+    
     return await this.kanbanColumnRepository.find({
       where: { userId, isActive: true },
       order: { order: 'ASC' },
@@ -1604,9 +1624,7 @@ export class GmailService {
       throw new Error('Column not found');
     }
 
-    if (column.isDefault) {
-      throw new Error('Cannot modify default columns');
-    }
+    // Default columns are now editable - no restriction needed
 
     if (updates.name !== undefined) {
       column.name = updates.name;
@@ -1637,9 +1655,7 @@ export class GmailService {
         return { success: false, error: 'Column not found' };
       }
 
-      if (column.isDefault) {
-        return { success: false, error: 'Cannot delete default columns' };
-      }
+      // Default columns are now deletable - no restriction needed
 
       // Move emails from this column back to inbox
       await this.emailRawRepository

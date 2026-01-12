@@ -864,7 +864,7 @@ export class GmailService {
   }
 
   /**
-   * Get email detail by ID
+   * Get email detail by ID (with attachments info)
    */
   async getEmailDetail(userId: number, emailId: number): Promise<any | null> {
     const email = await this.emailRawRepository.findOne({
@@ -878,7 +878,53 @@ export class GmailService {
       return null;
     }
 
-    return await this.enrichEmailWithSummary(email);
+    // Get base enriched data
+    const enrichedEmail = await this.enrichEmailWithSummary(email);
+
+    // Fetch attachments info from Gmail
+    try {
+      const gmail = await this.getGmailClient(userId);
+      const message = await gmail.users.messages.get({
+        userId: 'me',
+        id: email.gmailId,
+        format: 'full',
+      });
+
+      const attachments: Array<{
+        attachmentId: string;
+        filename: string;
+        mimeType: string;
+        size: number;
+      }> = [];
+
+      // Extract attachments from message parts
+      const extractAttachments = (parts: any[]) => {
+        for (const part of parts) {
+          if (part.filename && part.body?.attachmentId) {
+            attachments.push({
+              attachmentId: part.body.attachmentId,
+              filename: part.filename,
+              mimeType: part.mimeType || 'application/octet-stream',
+              size: part.body.size || 0,
+            });
+          }
+          if (part.parts) {
+            extractAttachments(part.parts);
+          }
+        }
+      };
+
+      if (message.data.payload?.parts) {
+        extractAttachments(message.data.payload.parts);
+      }
+
+      enrichedEmail.attachments = attachments;
+    } catch (error) {
+      console.error('Error fetching attachments:', error);
+      enrichedEmail.attachments = [];
+    }
+
+    return enrichedEmail;
   }
 
   /**
@@ -928,6 +974,15 @@ export class GmailService {
     try {
       const gmail = await this.getGmailClient(userId);
 
+      // Helper to encode subject with RFC 2047 MIME encoded-word for UTF-8
+      const encodeSubject = (subj: string): string => {
+        if (/[^\x00-\x7F]/.test(subj)) {
+          const encoded = Buffer.from(subj, 'utf-8').toString('base64');
+          return `=?UTF-8?B?${encoded}?=`;
+        }
+        return subj;
+      };
+
       // Build email message
       const messageParts: string[] = [];
       messageParts.push(`To: ${to.join(', ')}`);
@@ -937,7 +992,7 @@ export class GmailService {
       if (bcc && bcc.length > 0) {
         messageParts.push(`Bcc: ${bcc.join(', ')}`);
       }
-      messageParts.push(`Subject: ${subject}`);
+      messageParts.push(`Subject: ${encodeSubject(subject)}`);
       messageParts.push('Content-Type: text/html; charset=utf-8');
       messageParts.push('');
       messageParts.push(body);
@@ -1012,10 +1067,22 @@ export class GmailService {
       const subject = getHeader('Subject');
       const messageId = getHeader('Message-ID');
 
+      // Helper to encode subject with RFC 2047 MIME encoded-word for UTF-8
+      const encodeSubject = (subj: string): string => {
+        // Check if subject contains non-ASCII characters
+        if (/[^\x00-\x7F]/.test(subj)) {
+          // Encode as base64 with UTF-8 charset
+          const encoded = Buffer.from(subj, 'utf-8').toString('base64');
+          return `=?UTF-8?B?${encoded}?=`;
+        }
+        return subj;
+      };
+
       // Build reply message
+      const replySubject = `Re: ${subject.replace(/^Re:\s*/i, '')}`;
       const messageParts: string[] = [];
       messageParts.push(`To: ${fromEmail}`);
-      messageParts.push(`Subject: Re: ${subject.replace(/^Re:\s*/i, '')}`);
+      messageParts.push(`Subject: ${encodeSubject(replySubject)}`);
       if (messageId) {
         messageParts.push(`In-Reply-To: ${messageId}`);
         messageParts.push(`References: ${messageId}`);
@@ -1050,6 +1117,131 @@ export class GmailService {
       return {
         success: false,
         error: error.message || 'Failed to reply to email',
+      };
+    }
+  }
+
+  /**
+   * Forward an email to new recipients
+   */
+  async forwardEmail(
+    userId: number,
+    emailId: number,
+    to: string[],
+    message?: string,
+    cc?: string[],
+  ): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    try {
+      // Get original email from database
+      const originalEmail = await this.emailRawRepository.findOne({
+        where: { id: emailId, userId },
+      });
+
+      if (!originalEmail) {
+        return { success: false, error: 'Email not found' };
+      }
+
+      // Get original message from Gmail with full content
+      const gmail = await this.getGmailClient(userId);
+      const originalMessage = await gmail.users.messages.get({
+        userId: 'me',
+        id: originalEmail.gmailId,
+        format: 'full',
+      });
+
+      const headers = originalMessage.data.payload?.headers || [];
+      const getHeader = (name: string) =>
+        headers.find((h: any) => h.name === name)?.value || '';
+
+      const originalFrom = getHeader('From');
+      const originalTo = getHeader('To');
+      const originalSubject = getHeader('Subject');
+      const originalDate = getHeader('Date');
+
+      // Extract original body
+      let originalBody = '';
+      const extractBody = (parts: any[]): string => {
+        for (const part of parts) {
+          if (part.mimeType === 'text/html' && part.body?.data) {
+            return Buffer.from(part.body.data, 'base64').toString('utf-8');
+          }
+          if (part.mimeType === 'text/plain' && part.body?.data) {
+            const text = Buffer.from(part.body.data, 'base64').toString('utf-8');
+            return `<pre>${text}</pre>`;
+          }
+          if (part.parts) {
+            const nested = extractBody(part.parts);
+            if (nested) return nested;
+          }
+        }
+        return '';
+      };
+
+      if (originalMessage.data.payload?.body?.data) {
+        originalBody = Buffer.from(originalMessage.data.payload.body.data, 'base64').toString('utf-8');
+      } else if (originalMessage.data.payload?.parts) {
+        originalBody = extractBody(originalMessage.data.payload.parts);
+      }
+
+      // Build forward message body
+      const forwardedContent = `
+${message ? `<p>${message}</p><br/>` : ''}
+<div style="border-left: 2px solid #ccc; padding-left: 10px; margin-left: 10px;">
+  <p><strong>---------- Forwarded message ---------</strong></p>
+  <p><strong>From:</strong> ${originalFrom}</p>
+  <p><strong>Date:</strong> ${originalDate}</p>
+  <p><strong>Subject:</strong> ${originalSubject}</p>
+  <p><strong>To:</strong> ${originalTo}</p>
+  <br/>
+  ${originalBody}
+</div>`;
+
+      // Helper to encode subject with RFC 2047 MIME encoded-word for UTF-8
+      const encodeSubject = (subj: string): string => {
+        if (/[^\x00-\x7F]/.test(subj)) {
+          const encoded = Buffer.from(subj, 'utf-8').toString('base64');
+          return `=?UTF-8?B?${encoded}?=`;
+        }
+        return subj;
+      };
+
+      // Build message headers
+      const forwardSubject = `Fwd: ${originalSubject.replace(/^Fwd:\s*/i, '')}`;
+      const messageParts: string[] = [];
+      messageParts.push(`To: ${to.join(', ')}`);
+      if (cc && cc.length > 0) {
+        messageParts.push(`Cc: ${cc.join(', ')}`);
+      }
+      messageParts.push(`Subject: ${encodeSubject(forwardSubject)}`);
+      messageParts.push('Content-Type: text/html; charset=utf-8');
+      messageParts.push('');
+      messageParts.push(forwardedContent);
+
+      const rawMessage = messageParts.join('\r\n');
+
+      // Encode message
+      const encodedMessage = Buffer.from(rawMessage)
+        .toString('base64')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+
+      const response = await gmail.users.messages.send({
+        userId: 'me',
+        requestBody: {
+          raw: encodedMessage,
+        },
+      });
+
+      return {
+        success: true,
+        messageId: response.data.id || undefined,
+      };
+    } catch (error: any) {
+      console.error('Forward email error:', error);
+      return {
+        success: false,
+        error: error.message || 'Failed to forward email',
       };
     }
   }
@@ -1122,11 +1314,12 @@ export class GmailService {
   }
 
   /**
-   * Delete email
+   * Delete email (move to trash by default, or permanently delete)
    */
   async deleteEmail(
     userId: number,
     emailId: number,
+    permanentDelete: boolean = false,
   ): Promise<{ success: boolean; error?: string }> {
     try {
       const email = await this.emailRawRepository.findOne({
@@ -1139,13 +1332,24 @@ export class GmailService {
 
       const gmail = await this.getGmailClient(userId);
 
-      await gmail.users.messages.delete({
-        userId: 'me',
-        id: email.gmailId,
-      });
-
-      // Delete from local database
-      await this.emailRawRepository.delete({ id: emailId });
+      if (permanentDelete) {
+        // Permanently delete the email
+        await gmail.users.messages.delete({
+          userId: 'me',
+          id: email.gmailId,
+        });
+        // Delete from local database
+        await this.emailRawRepository.delete({ id: emailId });
+      } else {
+        // Move to trash
+        await gmail.users.messages.trash({
+          userId: 'me',
+          id: email.gmailId,
+        });
+        // Update local database to reflect trash status
+        email.labels = JSON.stringify(['TRASH']);
+        await this.emailRawRepository.save(email);
+      }
 
       return { success: true };
     } catch (error: any) {

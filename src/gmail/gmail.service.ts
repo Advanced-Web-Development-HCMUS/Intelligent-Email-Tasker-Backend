@@ -7,6 +7,7 @@ import { GmailToken } from './entities/gmail-token.entity';
 import { KanbanColumn } from './entities/kanban-column.entity';
 import { User } from '../auth/entities/user.entity';
 import { EmailSummary } from '../ai/entities/email-summary.entity';
+import { EmailMetadata } from '../ai/entities/email-metadata.entity';
 import { KafkaService } from '../kafka/kafka.service';
 import { KanbanStatus } from './dto/update-email-status.dto';
 
@@ -28,6 +29,8 @@ export class GmailService {
     private readonly userRepository: Repository<User>,
     @InjectRepository(EmailSummary)
     private readonly emailSummaryRepository: Repository<EmailSummary>,
+    @InjectRepository(EmailMetadata)
+    private readonly emailMetadataRepository: Repository<EmailMetadata>,
     private readonly kafkaService: KafkaService,
   ) {}
 
@@ -780,9 +783,14 @@ export class GmailService {
    * Helper method to enrich email with summary
    */
   private async enrichEmailWithSummary(email: EmailRaw): Promise<any> {
-    const summary = await this.emailSummaryRepository.findOne({
-      where: { emailRawId: email.id },
-    });
+    const [summary, metadata] = await Promise.all([
+      this.emailSummaryRepository.findOne({
+        where: { emailRawId: email.id },
+      }),
+      this.emailMetadataRepository.findOne({
+        where: { emailRawId: email.id },
+      }),
+    ]);
 
     if (!email) {
       return null;
@@ -822,6 +830,18 @@ export class GmailService {
       return [{ name: emailString, email: emailString }];
     };
 
+    // Get attachment info from metadata
+    let attachmentCount = 0;
+    let attachmentTypes: string[] = [];
+    if (metadata?.attachmentTypes) {
+      try {
+        attachmentTypes = JSON.parse(metadata.attachmentTypes);
+        attachmentCount = attachmentTypes.length;
+      } catch (e) {
+        // Ignore parse errors
+      }
+    }
+
     // Parse JSON fields and format for frontend
     return {
       id: email.id,
@@ -846,7 +866,9 @@ export class GmailService {
       labels: email.labels ? JSON.parse(email.labels) : [],
       receivedAt: email.receivedAt,
       sentAt: email.sentAt,
-      attachments: [], // TODO: Extract attachments from rawData if needed
+      hasAttachment: metadata?.hasAttachment || false,
+      attachmentCount,
+      attachments: [], // Will be populated only in email detail view
       createdAt: email.createdAt,
       updatedAt: email.updatedAt,
       status: email.status || 'inbox',
@@ -1298,8 +1320,34 @@ ${message ? `<p>${message}</p><br/>` : ''}
       });
 
       // Update local database
+      let needsSave = false;
+
       if (actions.markRead !== undefined) {
         email.isRead = actions.markRead;
+        needsSave = true;
+      }
+
+      // Update isStarred based on STARRED label changes
+      if (addLabelIds.includes('STARRED')) {
+        email.isStarred = true;
+        needsSave = true;
+      }
+      if (removeLabelIds.includes('STARRED')) {
+        email.isStarred = false;
+        needsSave = true;
+      }
+
+      // Update isImportant based on IMPORTANT label changes
+      if (addLabelIds.includes('IMPORTANT')) {
+        email.isImportant = true;
+        needsSave = true;
+      }
+      if (removeLabelIds.includes('IMPORTANT')) {
+        email.isImportant = false;
+        needsSave = true;
+      }
+
+      if (needsSave) {
         await this.emailRawRepository.save(email);
       }
 
@@ -1606,12 +1654,28 @@ ${message ? `<p>${message}</p><br/>` : ''}
       .take(limit)
       .getMany();
 
-    // Format emails with summaries
+    // Format emails with summaries and metadata
     const formattedEmails = await Promise.all(
       emails.map(async (email) => {
-        const summary = await this.emailSummaryRepository.findOne({
-          where: { emailRawId: email.id },
-        });
+        const [summary, metadata] = await Promise.all([
+          this.emailSummaryRepository.findOne({
+            where: { emailRawId: email.id },
+          }),
+          this.emailMetadataRepository.findOne({
+            where: { emailRawId: email.id },
+          }),
+        ]);
+
+        // Get attachment count from metadata
+        let attachmentCount = 0;
+        if (metadata?.attachmentTypes) {
+          try {
+            const types = JSON.parse(metadata.attachmentTypes);
+            attachmentCount = types.length;
+          } catch (e) {
+            // Ignore parse errors
+          }
+        }
 
         return {
           id: email.id,
@@ -1633,6 +1697,8 @@ ${message ? `<p>${message}</p><br/>` : ''}
           createdAt: email.createdAt,
           status: email.status || 'inbox',
           snoozeUntil: email.snoozeUntil,
+          hasAttachment: metadata?.hasAttachment || false,
+          attachmentCount,
           summary: summary
             ? {
                 summary: summary.summary,

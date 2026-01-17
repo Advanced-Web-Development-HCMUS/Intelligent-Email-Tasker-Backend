@@ -8,12 +8,13 @@ import { GmailToken } from './entities/gmail-token.entity';
 import { KanbanColumn } from './entities/kanban-column.entity';
 import { User } from '../auth/entities/user.entity';
 import { EmailSummary } from '../ai/entities/email-summary.entity';
+import { EmailMetadata } from '../ai/entities/email-metadata.entity';
 import { KafkaModule } from '../kafka/kafka.module';
 import { AIModule } from '../ai/ai.module';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([EmailRaw, GmailToken, KanbanColumn, User, EmailSummary]),
+    TypeOrmModule.forFeature([EmailRaw, GmailToken, KanbanColumn, User, EmailSummary, EmailMetadata]),
     KafkaModule,
     AIModule,
   ],

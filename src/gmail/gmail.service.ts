@@ -1953,4 +1953,138 @@ ${message ? `<p>${message}</p><br/>` : ''}
       };
     }
   }
+
+  /**
+   * Fuzzy search emails using PostgreSQL pg_trgm (Trigram)
+   * Searches in subject, sender name, sender email, and body text
+   * Good for typo-tolerant search
+   */
+  async fuzzySearchEmails(
+    userId: number,
+    query: string,
+    limit: number,
+  ): Promise<{
+    results: Array<{
+      email: any;
+      similarityScore: number;
+      matchedField: string;
+    }>;
+    total: number;
+  }> {
+    // Use pg_trgm similarity search
+    // Search in subject, fromName, from, and bodyText
+    const queryBuilder = this.emailRawRepository
+      .createQueryBuilder('email')
+      .where('email.userId = :userId', { userId })
+      .andWhere(
+        `(
+          similarity(COALESCE(email.subject, ''), :query) > 0.1 OR
+          similarity(COALESCE(email.fromName, ''), :query) > 0.1 OR
+          similarity(COALESCE(email.from, ''), :query) > 0.1 
+        )`,
+        { query: query.toLowerCase() },
+      )
+      .orderBy(
+        `GREATEST(
+          similarity(COALESCE(email.subject, ''), :query),
+          similarity(COALESCE(email.fromName, ''), :query),
+          similarity(COALESCE(email.from, ''), :query)
+        )`,
+        'DESC',
+      )
+      .limit(limit);
+
+    const emails = await queryBuilder.getMany();
+
+    // Calculate similarity scores and determine matched field
+    const results = emails.map((email) => {
+      const subjectSimilarity = this.calculateSimilarity(email.subject || '', query);
+      const fromNameSimilarity = this.calculateSimilarity(email.fromName || '', query);
+      const fromSimilarity = this.calculateSimilarity(email.from || '', query);
+      const bodyTextSimilarity = this.calculateSimilarity(email.bodyText || '', query) * 0.5;
+
+      const maxSimilarity = Math.max(
+        subjectSimilarity,
+        fromNameSimilarity,
+        fromSimilarity,
+        bodyTextSimilarity,
+      );
+
+      let matchedField = 'subject';
+      if (maxSimilarity === fromNameSimilarity) {
+        matchedField = 'fromName';
+      } else if (maxSimilarity === fromSimilarity) {
+        matchedField = 'from';
+      } else if (maxSimilarity === bodyTextSimilarity) {
+        matchedField = 'body';
+      }
+
+      return {
+        email: {
+          id: email.id,
+          gmailId: email.gmailId,
+          threadId: email.threadId,
+          from: email.from,
+          fromName: email.fromName,
+          to: email.to ? JSON.parse(email.to) : [],
+          cc: email.cc ? JSON.parse(email.cc) : [],
+          bcc: email.bcc ? JSON.parse(email.bcc) : [],
+          subject: email.subject,
+          snippet: email.snippet,
+          bodyText: email.bodyText,
+          bodyHtml: email.bodyHtml,
+          isRead: email.isRead,
+          isStarred: email.isStarred,
+          isImportant: email.isImportant,
+          labels: email.labels ? JSON.parse(email.labels) : [],
+          receivedAt: email.receivedAt,
+          sentAt: email.sentAt,
+          status: email.status || 'inbox',
+          snoozeUntil: email.snoozeUntil,
+          createdAt: email.createdAt,
+          updatedAt: email.updatedAt,
+        },
+        similarityScore: Math.round(maxSimilarity * 100) / 100,
+        matchedField,
+      };
+    });
+
+    return {
+      results,
+      total: results.length,
+    };
+  }
+
+  /**
+   * Helper method to calculate string similarity (approximation)
+   * This is a fallback in case pg_trgm is not available
+   */
+  private calculateSimilarity(str1: string, str2: string): number {
+    const s1 = str1.toLowerCase();
+    const s2 = str2.toLowerCase();
+
+    if (s1 === s2) return 1;
+    if (s1.length === 0 || s2.length === 0) return 0;
+
+    // Simple trigram-like similarity
+    const trigrams1 = this.getTrigrams(s1);
+    const trigrams2 = this.getTrigrams(s2);
+
+    const intersection = trigrams1.filter((t) => trigrams2.includes(t)).length;
+    const union = new Set([...trigrams1, ...trigrams2]).size;
+
+    return union > 0 ? intersection / union : 0;
+  }
+
+  /**
+   * Generate trigrams from a string
+   */
+  private getTrigrams(str: string): string[] {
+    const padded = `  ${str} `;
+    const trigrams: string[] = [];
+    for (let i = 0; i < padded.length - 2; i++) {
+      trigrams.push(padded.substring(i, i + 3));
+    }
+    return trigrams;
+  }
 }

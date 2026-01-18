@@ -257,7 +257,7 @@ export class GmailController {
     @Request() req: any,
   ): Promise<TBaseDTO<{ synced: number; message: string }>> {
       const userId = req.user.userId;
-    const result = await this.gmailService.fetchAndStoreEmails(userId, 10);
+    const result = await this.gmailService.fetchAndStoreEmails(userId,50);
 
     if (result.success) {
       return new TBaseDTO<{ synced: number; message: string }>({
@@ -990,19 +990,19 @@ export class GmailController {
   }
 
   /**
-   * Fuzzy search emails using semantic search (Qdrant)
-   * Searches in subject, sender (name + email), and summary with typo tolerance
+   * Semantic search (Qdrant)
+   * Searches in subject, sender (name + email), and sematic search return relavant content
    */
-  @Get('search/fuzzy')
+  @Get('search/semantic')
   @UseGuards(JwtAuthGuard)
   @ApiBearerAuth('JWT-auth')
   @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: 'Fuzzy search emails with typo tolerance using semantic search' })
+  @ApiOperation({ summary: 'Semantic search' })
   @ApiQuery({ name: 'q', description: 'Search query', required: true })
   @ApiQuery({ name: 'limit', required: false, type: Number, description: 'Maximum results (default: 50, max: 100)' })
   @ApiResponse({
     status: 200,
-    description: 'Fuzzy search results retrieved successfully',
+    description: 'Semantic search results retrieved successfully',
     type: TBaseDTO<{
       results: Array<{
         email: any;
@@ -1013,7 +1013,7 @@ export class GmailController {
   })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
   @ApiResponse({ status: 400, description: 'Bad request - query is required' })
-  async fuzzySearch(
+  async semanticSearch(
     @Request() req: any,
     @Query('q') query: string,
     @Query('limit') limit?: string,
@@ -1146,6 +1146,107 @@ export class GmailController {
         undefined,
         undefined,
         error.message || 'Search failed',
+      );
+    }
+  }
+
+  /**
+   * Fuzzy search (pg_trgm Trigram)
+   * Typo-tolerant search in subject, sender name, sender email, and body text
+   */
+  @Get('search/fuzzy')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('JWT-auth')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Fuzzy search using PostgreSQL pg_trgm for typo-tolerant search' })
+  @ApiQuery({ name: 'q', description: 'Search query', required: true })
+  @ApiQuery({ name: 'limit', required: false, type: Number, description: 'Maximum results (default: 50, max: 100)' })
+  @ApiResponse({
+    status: 200,
+    description: 'Fuzzy search results retrieved successfully',
+    type: TBaseDTO<{
+      results: Array<{
+        email: any;
+        similarityScore: number;
+        matchedField: string;
+      }>;
+      total: number;
+    }>,
+  })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 400, description: 'Bad request - query is required' })
+  async fuzzySearch(
+    @Request() req: any,
+    @Query('q') query: string,
+    @Query('limit') limit?: string,
+  ): Promise<TBaseDTO<{
+    results: Array<{
+      email: any;
+      similarityScore: number;
+      matchedField: string;
+    }>;
+    total: number;
+  }>> {
+    if (!query || query.trim().length === 0) {
+      return new TBaseDTO<{
+        results: Array<{
+          email: any;
+          similarityScore: number;
+          matchedField: string;
+        }>;
+        total: number;
+      }>(
+        undefined,
+        undefined,
+        'Search query is required',
+      );
+    }
+
+    const userId = req.user.userId;
+    const limitNum = limit ? Math.min(parseInt(limit, 10), 100) : 50;
+
+    if (limitNum < 1) {
+      return new TBaseDTO<{
+        results: Array<{
+          email: any;
+          similarityScore: number;
+          matchedField: string;
+        }>;
+        total: number;
+      }>(
+        undefined,
+        undefined,
+        'Limit must be a positive number',
+      );
+    }
+
+    try {
+      const result = await this.gmailService.fuzzySearchEmails(
+        userId,
+        query.trim(),
+        limitNum,
+      );
+
+      return new TBaseDTO<{
+        results: Array<{
+          email: any;
+          similarityScore: number;
+          matchedField: string;
+        }>;
+        total: number;
+      }>(result);
+    } catch (error: any) {
+      return new TBaseDTO<{
+        results: Array<{
+          email: any;
+          similarityScore: number;
+          matchedField: string;
+        }>;
+        total: number;
+      }>(
+        undefined,
+        undefined,
+        error.message || 'Fuzzy search failed',
       );
     }
   }

@@ -96,7 +96,7 @@ export class QdrantService implements OnModuleInit {
     limit: number = 10,
   ): Promise<Array<{ id: number; score: number; payload: any }>> {
     try {
-      const threshold = parseFloat(process.env.QDRANT_SCORE_THRESHOLD || '0.5');
+      const threshold = parseFloat(process.env.QDRANT_SCORE_THRESHOLD || '0.1');
 
       const result = await this.client.api('points').search({
         collectionName: this.collectionName,

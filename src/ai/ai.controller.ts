@@ -91,7 +91,7 @@ export class AIController {
       // Filter by minimum score and enrich with full email data
       const filteredResults = await Promise.all(
         qdrantResults
-          .filter((r) => r.score > 0.5) // Lower threshold for better recall
+          .filter((r) => r.score > 0.1) // Lower threshold for better recall
           .slice(0, limit)
           .map(async (result) => {
             // Get full email data from database

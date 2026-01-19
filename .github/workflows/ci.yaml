@@ -22,6 +22,10 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_PASSWORD }}
 
+      - name: Get Short SHA
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
       - name: Build & Push Docker image
         uses: docker/build-push-action@v6
         with:
@@ -29,4 +33,5 @@ jobs:
           push: true
           tags: |
             ${{ secrets.DOCKERHUB_USERNAME }}/itel-email-tasker:latest
-            ${{ secrets.DOCKERHUB_USERNAME }}/itel-email-tasker:${{ github.sha::7 }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/itel-email-tasker:${{ steps.vars.outputs.sha_short }}
+            

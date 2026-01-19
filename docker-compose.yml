@@ -16,6 +16,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - itel-email-tasker-network
 
   kafka:
     image: confluentinc/cp-kafka:7.5.0
@@ -48,6 +50,8 @@ services:
       CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
     volumes:
       - /mnt/kafka-data:/var/lib/kafka/data
+    networks:
+      - itel-email-tasker-network
 
   qdrant:
     image: qdrant/qdrant:latest
@@ -63,3 +67,9 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - itel-email-tasker-network
+
+networks:
+  itel-email-tasker-network:
+    external: true

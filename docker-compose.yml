@@ -10,44 +10,44 @@ services:
     ports:
       - "${POSTGRES_PORT:-5433}:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
-    networks:
-      - ticket-network
+      - /mnt/postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
       interval: 10s
       timeout: 5s
       retries: 5
 
-  zookeeper:
-    image: confluentinc/cp-zookeeper:7.5.0
-    container_name: email-auth-zookeeper
-    restart: unless-stopped
-    environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
-      ZOOKEEPER_TICK_TIME: 2000
-    ports:
-      - "2181:2181"
-
   kafka:
     image: confluentinc/cp-kafka:7.5.0
     container_name: email-auth-kafka
+    hostname: kafka
     restart: unless-stopped
-    depends_on:
-      - zookeeper
     ports:
-      - "${KAFKA_PORT:-9092}:9092"
+      - "9092:9092"
+      - "9101:9101"
     environment:
-      KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092'
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
-    healthcheck:
-      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_MESSAGE_MAX_BYTES: 200000000
+      KAFKA_SOCKET_REQUEST_MAX_BYTES: 200000000
+      KAFKA_MAX_REQUEST_BYTES: 200000000
+      KAFKA_PRODUCER_MAX_REQUEST_SIZE: 200000000
+      KAFKA_JMX_PORT: 9101
+      KAFKA_JMX_HOSTNAME: localhost
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:29093'
+      KAFKA_LISTENERS: 'PLAINTEXT://kafka:29092,CONTROLLER://kafka:29093,PLAINTEXT_HOST://0.0.0.0:9092'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_LOG_DIRS: '/tmp/kraft-combined-logs'
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+    volumes:
+      - /mnt/kafka-data:/var/lib/kafka/data
 
   qdrant:
     image: qdrant/qdrant:latest
@@ -57,19 +57,9 @@ services:
       - "6333:6333"
       - "6334:6334"
     volumes:
-      - qdrant_data:/qdrant/storage
+      - /mnt/qdrant_data:/qdrant/storage
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
       interval: 10s
       timeout: 5s
       retries: 5
-
-volumes:
-  postgres_data:
-    driver: local
-  qdrant_data:
-    driver: local
-
-networks:
-  ticket-network:
-    driver: bridge

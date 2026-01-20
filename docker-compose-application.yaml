@@ -1,0 +1,16 @@
+services:
+  backend:
+    image: thmtthu1/itel-email-tasker:0cfdfb1
+    container_name: email-auth-backend
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    networks:
+      - itel-email-tasker-network
+    env_file:
+      - .env
+
+
+networks:
+  itel-email-tasker-network:
+    external: true

@@ -64,6 +64,15 @@ jobs:
     needs: build-and-push
 
     steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          clean: true
+      - name: Update code on VM
+        run: |
+          git fetch origin main
+          git reset --hard origin/main
       - name: Generate Image Metadata
         id: meta
         shell: bash

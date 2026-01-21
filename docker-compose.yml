@@ -10,7 +10,7 @@ services:
     ports:
       - "${POSTGRES_PORT:-5433}:5432"
     volumes:
-      - /mnt/postgres_data:/var/lib/postgresql/data
+      - /mnt/data/postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
       interval: 10s
@@ -49,7 +49,7 @@ services:
       KAFKA_LOG_DIRS: '/tmp/kraft-combined-logs'
       CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
     volumes:
-      - /mnt/kafka-data:/var/lib/kafka/data
+      - /mnt/data/kafka-data:/var/lib/kafka/data
     networks:
       - itel-email-tasker-network
 
@@ -61,12 +61,7 @@ services:
       - "6333:6333"
       - "6334:6334"
     volumes:
-      - /mnt/qdrant_data:/qdrant/storage
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      - /mnt/data/qdrant_data:/qdrant/storage
     networks:
       - itel-email-tasker-network
 

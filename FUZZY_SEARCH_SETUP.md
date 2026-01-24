@@ -4,6 +4,7 @@
 
 Extension `pg_trgm` (Trigram) của PostgreSQL được sử dụng để tìm kiếm fuzzy search - tìm kiếm có khả năng chấp nhận lỗi chính tả và typo.
 
+
 ## Cài đặt
 
 ### 1. Kết nối vào PostgreSQL
